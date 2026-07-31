@@ -19,43 +19,42 @@
 
 ## Компиляция
 
-### Shared library для C API:
+### Через CMake (рекомендуется)
 
 ```bash
+mkdir build && cd build
+cmake ..
+make -j8
+```
+
+Собираются:
+- `lib/libport_scanner.dylib` (macOS) или `lib/libport_scanner.so` (Linux)
+- `port_scanner_cli` — CLI executable
+
+### Прямая компиляция (для Dart FFI / Android NDK)
+
+```bash
+# macOS
+g++ -std=c++17 -shared -fPIC -o libport_scanner.dylib port_scanner.cpp -pthread
+
+# Linux
 g++ -std=c++17 -shared -fPIC -o libport_scanner.so port_scanner.cpp -pthread
+
+# Android arm64-v8a (через NDK)
+$NDK/toolchains/llvm/prebuilt/darwin-x86_64/bin/aarch64-linux-android21-clang++ \
+  -std=c++17 -shared -fPIC \
+  -o libport_scanner_arm64-v8a.so \
+  port_scanner.cpp -pthread
 ```
-
-### CLI версия (через C API):
-
-```bash
-g++ -std=c++17 -o port_scanner_cli port_scanner_cli.cpp -L. -lport_scanner -pthread
-```
-
-### Standalone версия (main.cpp):
-
-```bash
-g++ -std=c++17 -o port_scanner main.cpp -L. -lport_scanner -pthread
-```
-
-**Примечание:** Standalone версия (`main.cpp`) — это полноценный executable, который линкуется с `libport_scanner.so` и поддерживает все те же опции, что и `port_scanner_cli`. Отличается тем, что скомпилирована как отдельный бинарный файл без зависимости от CLI парсера.
 
 ## Использование
 
-Сканировщик доступен в двух версиях:
-
-1. **port_scanner_cli** — версия через C API (рекомендуется)
-2. **port_scanner** — standalone executable
-
-Обе версии поддерживают **одинаковые опции и флаги**.
+Доступен один исполняемый файл **port_scanner_cli**, который использует C API библиотеки `libport_scanner`.
 
 ### Базовое использование
 
 ```bash
-# CLI версия
 ./port_scanner_cli [опции]
-
-# Standalone версия
-./port_scanner [опции]
 ```
 
 ### Основные опции
@@ -73,8 +72,6 @@ g++ -std=c++17 -o port_scanner main.cpp -L. -lport_scanner -pthread
 #### Типы сканирования
 - `--syn` — SYN scan вместо connect scan (требует root/CAP_NET_RAW)
 - `--udp` — UDP сканирование
-- `-t, --timeout <ms>` — таймаут в миллисекундах (по умолчанию: 1000)
-- `-T, --threads <count>` — количество потоков (по умолчанию: 10)
 - `--rate-limit <n>` — ограничение скорости в пакетах/сек (по умолчанию: без ограничений)
 
 #### Дополнительные функции
@@ -89,9 +86,14 @@ g++ -std=c++17 -o port_scanner main.cpp -L. -lport_scanner -pthread
 |--------|----------|-----------------|------------------|
 | `--quick` | Быстрое сканирование | 1–100 | TCP Connect |
 | `--stealth` | Stealth сканирование | 1–1024 | SYN |
-| `--vuln` | Проверка уязвимостей | 1–1024 | TCP Connect + version detection |
+| `--vuln` | Проверка уязвимостей + версии | 1–1024 | TCP Connect + version detection |
 | `--full` | Полный скан | 1–65535 | SYN + UDP + version + banner |
 | `--all-scans` | Все функции | пользовательский | SYN + version + banner |
+
+**Важно:** Пресет `--vuln` включает version detection, но НЕ включает exploit checks. Для проверки уязвимостей используйте `--exploit <name>` отдельно:
+```bash
+sudo ./port_scanner_cli --vuln --exploit heartbleed --host target.com --range 443-443
+```
 
 ### Примеры использования пресетов
 
@@ -182,18 +184,25 @@ UDP сканирование проверяет открытость UDP пор�
 
 ### Exploit Checks
 
-Проверка на известные уязвимости после обнаружения открытых портов.
+Проверка на известные уязвимости выполняется для каждого открытого порта после обнаружения.
 
-**Поддерживаемые уязвимости:**
+**Реализованные проверки:**
 
-| Флаг | Уязвимость | CVE | Порт по умолчанию |
-|------|-----------|-----|-------------------|
-| `heartbleed` | Heartbleed Bug | CVE-2014-0160 | 443 |
-| `shellshock` | Bash Remote Code Execution | CVE-2014-6271 | 80, 443 |
-| `ghostscript` | Ghostscript RCE | CVE-2018-16509 | - |
-| `polecache` | Memcached Unauthorized Access | - | 11211 |
+| Уязвимость | CVE | Порт | Метод |
+|-----------|-----|------|-------|
+| **Heartbleed** | CVE-2014-0160 | 443 | Отправка malformed TLS heartbeat, анализ переполнения памяти |
+| **Shellshock** | CVE-2014-6271 | 80, 443 | HTTP запрос с exploit payload в User-Agent на CGI-скрипт |
+| **Polecache** | - | 11211 | Отправка команды `stats` на Memcached, проверка ответа |
 
-**Использование:**
+**Статус:**
+- ✅ **Heartbleed** — полностью реализован
+- ✅ **Shellshock** — полностью реализован  
+- ✅ **Polecache** — полностью реализован
+- ⚠️ **Ghostscript** — заглушка (требует реализации)
+
+**Результаты экспортируются в `vulnerabilities` массив каждого порта в JSON.
+
+### Использование:
 
 ```bash
 # Проверка на Heartbleed
@@ -211,7 +220,7 @@ sudo ./port_scanner_cli --vuln --exploit heartbleed --host target.com --range 44
 
 ### Rate Limiting
 
-Ограничение скорости отправки пакетов для обхода IDS/IPS.
+Ограничение скорости отправки пакетов для обхода IDS/IPS. Реализовано через token bucket алгоритм в worker threads.
 
 ```bash
 # Ограничение до 100 пакетов в секунду
@@ -222,6 +231,15 @@ sudo ./port_scanner_cli --rate-limit 1000 --host target.com --range 1-65535
 
 # Stealth mode (10 pkt/s)
 sudo ./port_scanner_cli --syn --rate-limit 10 --host target.com --range 1-1024
+```
+
+### UDP Scan
+
+Дополнительный пресет `--all-scans` включает SYN + version detection + banner grabbing:
+
+```bash
+# Включить все проверки
+sudo ./port_scanner_cli --all-scans --host target.com --range 1-1024
 ```
 
 ### Примеры
@@ -281,6 +299,12 @@ sudo ./port_scanner_cli --full --host target.com
 
 ## Как это работает
 
+### Архитектура сканирования
+
+Сканер работает в два этапа:
+1. **Параллельное сканирование всех хостов и портов** — work queue заполняется сразу для всех комбинаций, worker threads обрабатывают задачи с configurable rate limiting
+2. **Агрегация результатов** — после завершения сканирования статусы хостов определяются по результатам (ONLINE = есть открытые порты, NO_PORTS = хост ответил но портов нет, OFFLINE = не ответил ни на один запрос)
+
 ### TCP Connect Scan
 1. Программа создаёт TCP сокет и пытается установить полное соединение с портом
 2. При успехе — порт открыт, при ошибке — закрыт или недоступен
@@ -304,13 +328,11 @@ sudo ./port_scanner_cli --full --host target.com
 |-------|-------------|------------------------------------------------|-----------------------------------------|
 | 21    | FTP         | Команда `FEAT` (RFC 2389), парсинг 220 banner  | `vsFTPd 3.0.3`, `ProFTPD 1.3.5`        |
 | 22    | SSH         | Отправка `SSH-2.0-PortScanner`, парсинг ответа | `OpenSSH_8.9p1`, `OpenSSH_7.4p1`       |
-| 23    | Telnet      | IAC negotiation (RFC 854)                      | `Debian-4.6`, `FreeBSD Telnet`, `NetKit` |
-| 25    | SMTP        | Команда `EHLO`, парсинг 220 banner             | `Postfix`, `Exim`, `Microsoft ESMTP`, `Sendmail` |
-| 80    | HTTP        | `HEAD /` запрос, парсинг Server/X-Powered-By   | `nginx/1.18.0`, `Apache/2.4.41`, `Microsoft-IIS/10.0` |
+| 25    | SMTP        | Команда `EHLO`, парсинг 220 banner             | `Postfix`, `Exim`, `Microsoft ESMTP`   |
+| 80    | HTTP        | `HEAD /` запрос, парсинг Server/X-Powered-By   | `nginx/1.18.0`, `Apache/2.4.41`, `IIS` |
 | 443   | HTTPS       | TLS ClientHello + SNI, парсинг сертификата     | `nginx`, `Apache`, `TLS`               |
-| 3306  | MySQL       | MySQL init packet, парсинг handshake response  | `5.7.34`, `8.0.26`, `10.5.12-MariaDB`  |
-| 5432  | PostgreSQL  | PostgreSQL startup message v3.0                | `PostgreSQL 13.4`, `PostgreSQL 14.2`   |
 | 11211 | Memcached   | Команда `version`                              | `1.6.17`, `1.5.6`                      |
+| 27017 | MongoDB     | Автоматический greeting message                | `MongoDB 4.4.0`, `MongoDB 5.0.6`      |
 | —     | Default     | Чтение автоматического баннера (1-я строка)    | Первые 1024 байта баннера              |
 
 ### Banner Grabbing
@@ -376,6 +398,30 @@ SSL/TLS cert: CN=example.com [SELF-SIGNED]
 }
 ```
 
+Пример с найденной уязвимостью:
+
+```json
+{
+  "hosts": [
+    {
+      "address": "target.com",
+      "status": "online",
+      "ports": [
+        {
+          "port": 443,
+          "protocol": "tcp",
+          "state": "open",
+          "service": "HTTPS",
+          "version": "OpenSSL 1.0.1",
+          "ssl": true,
+          "vulnerabilities": ["Heartbleed (CVE-2014-0160)"]
+        }
+      ]
+    }
+  ]
+}
+```
+
 #### Поля JSON:
 
 **scan_info:**
@@ -397,7 +443,7 @@ SSL/TLS cert: CN=example.com [SELF-SIGNED]
 - `version` — версия сервиса (если определена)
 - `banner` — захваченный баннер
 - `ssl` — `true` если SSL/TLS детектирован
-- `vulnerabilities` — массив найденных уязвимостей (заглушка для будущих эксплойт-чеков)
+- `vulnerabilities` — массив найденных уязвимостей (Heartbleed, Shellshock, Polecache)
 
 **summary:**
 - `total_hosts` — всего хостов
@@ -413,6 +459,28 @@ SSL/TLS cert: CN=example.com [SELF-SIGNED]
 
 # Полный скан с экспортом
 ./port_scanner_cli --all-scans --host target.com --range 1-65535 --json full-report.json
+```
+
+#### Использование ScanReport (C API)
+
+```c
+// Получение полного отчёта
+ScanReport* report = scanner_get_report(scanner);
+
+printf("Scanned %d hosts, found %d open ports\n",
+       report->host_count, report->open_count);
+
+// Доступ к результатам
+for (int i = 0; i < report->port_count; i++) {
+    if (report->results[i].is_open) {
+        printf("Port %d open: %s %s\n",
+               report->results[i].port,
+               report->results[i].service,
+               report->results[i].version ? report->results[i].version : "no version");
+    }
+}
+
+scanner_free_report(report);
 ```
 
 #### Использование из Dart/Flutter:
@@ -462,14 +530,14 @@ void processResults(ScannerWrapper scanner) {
 
 ## Технические детали
 
-### Сканирование
+### Архитектура
 
-- **SYN Scan**: raw sockets (IPPROTO_TCP), manual TCP header construction, RFC 793 checksum, stealth mode
-- **Connect Scan**: standard socket()+connect() with SO_RCVTIMEO/SO_SNDTIMEO
-- **UDP Scan**: datagram sockets (IPPROTO_UDP), ICMP error analysis
-- **Graceful Degradation**: автоматический fallback на connect scan при отсутствии root/CAP_NET_RAW
-- **Port Detection**: TCP SYN/RST analysis, ICMP error handling (type 3, code 3 = port unreachable)
-- **Rate Limiting**: configurable packets per second for IDS evasion
+- **Параллельное сканирование**: work queue заполняется для всех хостов/портов, worker threads обрабатывают задачи асинхронно
+- **Thread Safety**: mutex для очереди, результатов, вывода; atomic для прогресса
+- **Rate Limiting**: token bucket алгоритм в worker threads для контроля скорости пакетов
+- **Exploit Checks**: выполняются для каждого открытого порта при активации (Heartbleed, Shellshock, Polecache)
+- **Progress tracking**: отдельный поток показывает прогресс в реальном времени
+- **Multi-platform**: macOS compatible (FFI для Flutter), Android NDK ready
 
 ### Version Detection
 
@@ -502,10 +570,11 @@ void processResults(ScannerWrapper scanner) {
 ```
 port_scanner/
 ├── port_scanner.h          # C API header
-├── port_scanner.cpp        # Core library (scan, version, banner, JSON)
+├── port_scanner.cpp        # Core library (scan, version, banner, JSON, exploits)
 ├── port_scanner_cli.cpp    # CLI с парсингом аргументов
-├── main.cpp                # Standalone executable
 ├── libport_scanner.so      # Shared library (Linux/Android)
+├── libport_scanner.dylib   # Shared library (macOS)
+├── port_scanner_cli        # CLI executable
 └── readme.md               # Документация
 ```
 
@@ -514,17 +583,18 @@ port_scanner/
 ### Быстрый старт
 
 ```bash
-# Сборка
-g++ -std=c++17 -o port_scanner main.cpp -L. -lport_scanner -pthread
+# Сборка (через CMake)
+mkdir build && cd build
+cmake .. && make
 
 # Простое сканирование localhost
-./port_scanner
+./port_scanner_cli
 
 # Сканирование конкретного хоста
-./port_scanner --host 192.168.1.1
+./port_scanner_cli --host 192.168.1.1
 
 # Сканирование диапазона портов
-./port_scanner --host target.com --range 1-1024
+./port_scanner_cli --host target.com --range 1-1024
 ```
 
 ### Все команды CLI
@@ -660,6 +730,9 @@ sudo ./port_scanner_cli --syn --all-scans --host target.com \
 # Для stealth сканирования — уменьшаем скорость
 sudo ./port_scanner_cli --syn --host target.com --range 1-65535 \
   --timeout 2000 --threads 5
+
+# Для обхода IDS — используем rate limiting
+sudo ./port_scanner_cli --syn --rate-limit 50 --host target.com --range 1-1024
 ```
 
 ### Troubleshooting
@@ -699,6 +772,52 @@ sudo setcap cap_net_raw+ep ./port_scanner_cli
 
 Для использования порт-сканера в Flutter-приложениях доступен C API, который можно вызывать через FFI.
 
+### Готовая Dart-обёртка
+
+В проекте есть готовый файл `port_scanner_ffi.dart` с удобной Dart API:
+
+```dart
+import 'port_scanner_ffi.dart';
+
+void main() async {
+  // Загрузка библиотеки
+  final scannerLib = PortScannerLib();
+  await scannerLib.load();
+  
+  // Создание сканера
+  final scanner = scannerLib.create(
+    hosts: ['127.0.0.1'],
+    startPort: 1,
+    endPort: 1024,
+    timeoutMs: 1000,
+    maxThreads: 10,
+  );
+  
+  // Включение опций
+  scannerLib.setVersionDetection(scanner, true);
+  scannerLib.setBannerGrabbing(scanner, true);
+  
+  // Запуск сканирования
+  scannerLib.scan(scanner);
+  
+  // Получение результатов
+  final count = scannerLib.getResultCount(scanner);
+  for (int i = 0; i < count; i++) {
+    final result = parsePortResult(scannerLib.getResult(scanner, i), scannerLib);
+    if (result.isOpen) {
+      print('Port ${result.port} ${result.service}${result.version != null ? ' (${result.version})' : ''}');
+    }
+  }
+  
+  // Экспорт в JSON
+  final json = scannerLib.exportJson(scanner);
+  print(json);
+  
+  // Очистка
+  scannerLib.destroy(scanner);
+}
+```
+
 ### Сборка shared library для macOS
 
 ```bash
@@ -729,137 +848,7 @@ $NDK/toolchains/llvm/prebuilt/darwin-x86_64/bin/armv7a-linux-androideabi21-clang
 
 Рекомендуется настроить CMakeLists.txt для автоматической сборки под все целевые архитектуры.
 
-### Dart API (через FFI)
-
-```dart
-import 'dart:ffi';
-import 'dart:io';
-import 'package:ffi/ffi.dart';
-
-final DynamicLibrary _lib = Platform.isAndroid
-    ? DynamicLibrary.open('libport_scanner.so')
-    : DynamicLibrary.open('libport_scanner.dylib');
-
-typedef ScannerCreateFn = Pointer<ScannerWrapper> Function(
-    Pointer<Pointer<Utf8>> hosts, Int32 hostsCount,
-    Int32 startPort, Int32 endPort,
-    Int32 timeoutMs, Int32 maxThreads);
-typedef ScannerCreate = Pointer<ScannerWrapper> Function(
-    Pointer<Pointer<Utf8>> hosts, Int32 hostsCount,
-    Int32 startPort, Int32 endPort,
-    Int32 timeoutMs, Int32 maxThreads);
-
-typedef ScannerDestroyFn = Void Function(Pointer<ScannerWrapper> scanner);
-typedef ScannerDestroy = Void Function(Pointer<ScannerWrapper> scanner);
-
-typedef ScannerScanFn = Void Function(Pointer<ScannerWrapper> scanner);
-typedef ScannerScan = Void Function(Pointer<ScannerWrapper> scanner);
-
-typedef ScannerGetResultCountFn = Int32 Function(Pointer<ScannerWrapper> scanner);
-typedef ScannerGetResultCount = Int32 Function(Pointer<ScannerWrapper> scanner);
-
-typedef ScannerGetResultFn = PortResult Function(Pointer<ScannerWrapper> scanner, Int32 index);
-typedef ScannerGetResult = PortResult Function(Pointer<ScannerWrapper> scanner, Int32 index);
-
-typedef ScannerGetHostStatusFn = HostStatus Function(Pointer<ScannerWrapper> scanner, Int32 index);
-typedef ScannerGetHostStatus = HostStatus Function(Pointer<ScannerWrapper> scanner, Int32 index);
-
-final scannerCreate = _lib.lookupFunction<ScannerCreateFn, ScannerCreate>('scanner_create');
-final scannerDestroy = _lib.lookupFunction<ScannerDestroyFn, ScannerDestroy>('scanner_destroy');
-final scannerScan = _lib.lookupFunction<ScannerScanFn, ScannerScan>('scanner_scan');
-final scannerGetResultCount = _lib.lookupFunction<ScannerGetResultCountFn, ScannerGetResultCount>('scanner_get_result_count');
-final scannerGetResult = _lib.lookupFunction<ScannerGetResultFn, ScannerGetResult>('scanner_get_result');
-final scannerGetHostStatus = _lib.lookupFunction<ScannerGetHostStatusFn, ScannerGetHostStatus>('scanner_get_host_status');
-
-@ ffi struct
-class HostStatus extends ffi.Struct {
-  external int value;
-}
-
-@ffi.struct
-class PortResult extends ffi.Struct {
-  external Pointer<ffi.Char> host;
-  external int port;
-  external int is_open;
-  external Pointer<ffi.Char> service;
-}
-
-Future<List<Map<String, dynamic>>> scanPorts({
-  required List<String> hosts,
-  int startPort = 1,
-  int endPort = 1024,
-  int timeoutMs = 1000,
-  int maxThreads = 10,
-}) async {
-  final hostArray = hosts.map((h) => h.toNativeUtf8()).toList();
-  final hostPtr = allocate<Pointer<Utf8>>(count: hosts.length);
-  
-  for (int i = 0; i < hosts.length; i++) {
-    hostPtr[i] = hostArray[i];
-  }
-
-  final scanner = scannerCreate(
-    hostPtr,
-    hosts.length.toInt(),
-    startPort.toInt(),
-    endPort.toInt(),
-    timeoutMs.toInt(),
-    maxThreads.toInt(),
-  );
-
-  if (scanner == nullptr) {
-    for (final h in hostArray) {
-      free(h);
-    }
-    free(hostPtr);
-    throw Exception('Failed to create scanner');
-  }
-
-  scannerScan(scanner);
-
-  final results = <Map<String, dynamic>>[];
-  final resultCount = scannerGetResultCount(scanner);
-
-  for (int i = 0; i < resultCount; i++) {
-    final result = scannerGetResult(scanner, i);
-    results.add({
-      'host': result.host.toDartString(),
-      'port': result.port,
-      'is_open': result.is_open == 1,
-      'service': result.service.toDartString(),
-    });
-    free(result.host);
-    free(result.service);
-  }
-
-  final hostStatusCount = hosts.length;
-  final hostStatuses = <String, String>{};
-
-  for (int i = 0; i < hostStatusCount; i++) {
-    final status = scannerGetHostStatus(scanner, i);
-    final statusStr = status.value == 0
-        ? 'ONLINE'
-        : status.value == 1
-            ? 'NO_PORTS'
-            : 'OFFLINE';
-    hostStatuses[hosts[i]] = statusStr;
-  }
-
-  scannerDestroy(scanner);
-
-  for (final h in hostArray) {
-    free(h);
-  }
-  free(hostPtr);
-
-  return {
-    'results': results,
-    'hostStatuses': hostStatuses,
-  };
-}
-```
-
-### C API функции
+### C API функции (для низкоуровневого доступа)
 
 В `port_scanner.h` определены следующие функции:
 
@@ -882,13 +871,14 @@ void scanner_set_rate_limit(ScannerWrapper* scanner, int packets_per_sec);
 
 // Получение результатов
 int scanner_get_result_count(ScannerWrapper* scanner);
+int scanner_get_host_count(ScannerWrapper* scanner);  // ← новое
 PortResult scanner_get_result(ScannerWrapper* scanner, int index);
 HostStatus scanner_get_host_status(ScannerWrapper* scanner, int index);
 
 // Экспорт
 char* scanner_export_json(ScannerWrapper* scanner);
-ScanReport* scanner_get_report(ScannerWrapper* scanner);
-void scanner_free_report(ScanReport* report);
+ScanReport* scanner_get_report(ScannerWrapper* scanner);    // ← новое
+void scanner_free_report(ScanReport* report);                // ← новое
 void scanner_free_json(char* json);
 ```
 

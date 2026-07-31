@@ -15,6 +15,11 @@ void printUsage(const char* program) {
     std::cout << "  -t, --timeout <ms>       Timeout in milliseconds (default: 1000)" << std::endl;
     std::cout << "  -T, --threads <count>    Number of threads (default: 10)" << std::endl;
     std::cout << "  -r, --range <start-end>  Port range (alternative to -s and -e)" << std::endl;
+    std::cout << "      --syn                SYN scan instead of connect scan" << std::endl;
+    std::cout << "      --version-detect     Enable version detection" << std::endl;
+    std::cout << "      --banner-grab        Enable banner grabbing" << std::endl;
+    std::cout << "      --json <file>        Export results to JSON file" << std::endl;
+    std::cout << "      --all-scans          Enable all scans (SYN + version + banner)" << std::endl;
     std::cout << "  -v, --version            Show version" << std::endl;
     std::cout << "  -?, --help               Show this help" << std::endl;
 }
@@ -41,6 +46,10 @@ int main(int argc, char* argv[]) {
     int endPort = 1024;
     int timeoutMs = 1000;
     int maxThreads = 10;
+    bool useSYN = false;
+    bool enableVersionDetect = false;
+    bool enableBannerGrab = false;
+    std::string jsonFile;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--host") == 0) {
@@ -73,8 +82,20 @@ int main(int argc, char* argv[]) {
                 startPort = std::stoi(range.substr(0, dash));
                 endPort = std::stoi(range.substr(dash + 1));
             }
+        } else if (strcmp(argv[i], "--syn") == 0) {
+            useSYN = true;
+        } else if (strcmp(argv[i], "--version-detect") == 0 || strcmp(argv[i], "--version") == 0) {
+            enableVersionDetect = true;
+        } else if (strcmp(argv[i], "--banner-grab") == 0) {
+            enableBannerGrab = true;
+        } else if (strcmp(argv[i], "--json") == 0) {
+            jsonFile = argv[++i];
+        } else if (strcmp(argv[i], "--all-scans") == 0) {
+            useSYN = true;
+            enableVersionDetect = true;
+            enableBannerGrab = true;
         } else if (strcmp(argv[i], "-v") == 0 || strcmp(argv[i], "--version") == 0) {
-            std::cout << "Port Scanner v1.2" << std::endl;
+            std::cout << "Port Scanner v2.0 (MVP)" << std::endl;
             return 0;
         } else if (strcmp(argv[i], "-?") == 0 || strcmp(argv[i], "--help") == 0) {
             printUsage(argv[0]);
@@ -91,6 +112,8 @@ int main(int argc, char* argv[]) {
         hostArray[i] = hosts[i].c_str();
     }
 
+    ScanType scanType = useSYN ? SCAN_TYPE_SYN : SCAN_TYPE_CONNECT;
+    
     ScannerWrapper* scanner = scanner_create(hostArray, static_cast<int>(hosts.size()),
                                               startPort, endPort, timeoutMs, maxThreads);
     
@@ -99,6 +122,10 @@ int main(int argc, char* argv[]) {
         delete[] hostArray;
         return 1;
     }
+
+    scanner_set_scan_type(scanner, scanType);
+    scanner_set_enable_version_detection(scanner, enableVersionDetect ? 1 : 0);
+    scanner_set_enable_banner_grabbing(scanner, enableBannerGrab ? 1 : 0);
 
     scanner_scan(scanner);
 
@@ -112,7 +139,14 @@ int main(int argc, char* argv[]) {
         PortResult result = scanner_get_result(scanner, i);
         std::cout << "[" << result.host << "] Port " << result.port 
                   << " - " << (result.is_open ? "OPEN" : "CLOSED")
-                  << " (" << result.service << ")" << std::endl;
+                  << " (" << result.service << ")";
+        if (result.version) {
+            std::cout << " v" << result.version;
+        }
+        if (result.banner) {
+            std::cout << " [Banner: " << result.banner << "]";
+        }
+        std::cout << std::endl;
     }
 
     std::cout << "\n=== Host Status ===" << std::endl;
@@ -121,6 +155,20 @@ int main(int argc, char* argv[]) {
         const char* statusStr = (status == HOST_STATUS_ONLINE) ? "ONLINE" :
                                 (status == HOST_STATUS_NO_PORTS) ? "NO-PORTS" : "OFFLINE";
         std::cout << hosts[i] << ": " << statusStr << std::endl;
+    }
+
+    // Export to JSON if requested
+    if (!jsonFile.empty()) {
+        char* json = scanner_export_json(scanner);
+        std::ofstream outFile(jsonFile);
+        if (outFile.is_open()) {
+            outFile << json;
+            outFile.close();
+            std::cout << "\nResults exported to: " << jsonFile << std::endl;
+        } else {
+            std::cerr << "Error: Cannot write to file " << jsonFile << std::endl;
+        }
+        scanner_free_json(json);
     }
 
     scanner_destroy(scanner);

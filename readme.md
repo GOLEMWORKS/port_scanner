@@ -1,20 +1,45 @@
-# Port Scanner
+# Port Scanner v2.0 (MVP)
 
-Утилита для сканирования портов с поддержкой многопоточности.
+Утилита для пентеста с поддержкой SYN scan, version detection, banner grabbing и экспорта в JSON.
+
+## Возможности
+
+- **TCP Connect Scan** — стандартное сканирование через connect()
+- **SYN Scan** — stealth сканирование через raw sockets (требует root/CAP_NET_RAW)
+- **Version Detection** — определение версий сервисов (SSH, FTP, SMTP, HTTP, Memcached и др.)
+- **Banner Grabbing** — захват баннеров сервисов
+- **SSL/TLS Detection** — автоматическое определение SSL портов
+- **JSON Export** — экспорт результатов в JSON (без внешних зависимостей)
+- **Graceful Degradation** — автоматический fallback на connect scan если SYN недоступен
+- **Multi-threaded** — высокопроизводительное многопоточное сканирование
 
 ## Компиляция
+
+### Shared library для C API:
+
+```bash
+g++ -std=c++17 -shared -fPIC -o libport_scanner.so port_scanner.cpp -pthread
+```
+
+### CLI версия:
+
+```bash
+g++ -std=c++17 -o port_scanner_cli port_scanner_cli.cpp -L. -lport_scanner -pthread
+```
+
+### Использовать main.cpp (standalone):
 
 ```bash
 g++ -std=c++17 -o port_scanner main.cpp -pthread
 ```
 
-## Использование
+## Использование CLI
 
 ```bash
-./port_scanner [опции]
+./port_scanner_cli [опции]
 ```
 
-### Опции
+### Основные опции
 
 - `-h, --host <hostname>` — хост для сканирования (по умолчанию: localhost). Можно указать несколько раз
 - `-f, --file <filename>` — файл со списком хостов (каждый хост на новой строке)
@@ -23,74 +48,88 @@ g++ -std=c++17 -o port_scanner main.cpp -pthread
 - `-t, --timeout <ms>` — таймаут в миллисекундах (по умолчанию: 1000)
 - `-T, --threads <count>` — количество потоков (по умолчанию: 10)
 - `-r, --range <start-end>` — диапазон портов (альтернатива -s и -e)
-- `-v, --version` — показать версию
-- `-?, --help` — показать справку
+
+### Новые опции (v2.0)
+
+- `--syn` — SYN scan вместо connect scan (требует root)
+- `--version-detect` — включить определение версий сервисов
+- `--banner-grab` — включить захват баннеров
+- `--json <file>` — экспорт результатов в JSON файл
+- `--all-scans` — включить все функции (SYN + version + banner)
+
+### Пресеты
+
+```bash
+# Быстрое сканирование (connect scan, топ-100 портов)
+./port_scanner_cli --start 1 --end 100
+
+# Stealth сканирование (SYN scan, топ-1024 портов)
+./port_scanner_cli --syn --start 1 --end 1024
+
+# Полный скан со всеми проверками
+./port_scanner_cli --all-scans --host 192.168.1.1
+```
 
 ### Примеры
 
-Сканирование localhost с портов 1 по 1024:
-
+Базовое сканирование:
 ```bash
-./port_scanner
+./port_scanner_cli
+./port_scanner_cli --host 192.168.1.1 --host 192.168.1.2
+./port_scanner_cli --file hosts.txt
 ```
 
-Сканирование нескольких хостов через командную строку:
-
+SYN scan с определением версий:
 ```bash
-./port_scanner --host 192.168.1.1 --host 192.168.1.2 --host example.com
+sudo ./port_scanner_cli --syn --version-detect --host example.com
 ```
 
-Сканирование хостов из файла:
-
+Полный скан с экспортом в JSON:
 ```bash
-./port_scanner --file hosts.txt
-```
-
-Содержимое `hosts.txt`:
-
-```
-192.168.1.1
-192.168.1.2
-example.com
-# комментарии начинаются с #
-```
-
-Сканирование диапазона портов 1-65535 с 20 потоками:
-
-```bash
-./port_scanner --range 1-65535 --threads 20
-```
-
-Сканирование с пользовательским таймаутом:
-
-```bash
-./port_scanner --host example.com --timeout 500 --start 1 --end 1000
-```
-
-Комбинированный пример:
-
-```bash
-./port_scanner --host 192.168.1.1 --file servers.txt --range 1-1024 --threads 15
+sudo ./port_scanner_cli --all-scans --json report.json --host 192.168.1.1 --range 1-1024
 ```
 
 ## Как это работает
 
-1. Программа принимает список хостов через командную строку или файл
-2. Создаёт пул из N рабочих потоков (по умолчанию 10)
-3. Для каждого хоста сканируются все порты из указанного диапазона
-4. Каждый поток забирает пару (хост, порт) из очереди и пытается установить TCP-соединение
-5. При успешном соединении порт считается открытым
-6. Для каждого порта определяется служба по номеру (FTP, SSH, HTTP и т.д.)
-7. Прогресс-бар показывает общий процент выполнения (все хосты + все порты)
-8. Результаты выводятся в консоль в формате: `[<хост>] [OPEN] Port <порт> - <служба>`
+### TCP Connect Scan
+1. Программа создаёт TCP сокет и пытается установить полное соединение с портом
+2. При успехе — порт открыт, при ошибке — закрыт или недоступен
+
+### SYN Scan ( Stealth )
+1. Создаётся raw socket для отправки пакетов на уровне IP
+2. Отправляется TCP SYN пакет с случайным source port
+3. Ответы:
+   - **SYN+ACK** → порт открыт, отправляется RST для разрыва (stealth)
+   - **RST** → порт закрыт
+   - **ICMP error** → порт недоступен/filtered
+4. **Graceful Degradation**: если raw sockets недоступны (нет root), автоматически переключается на connect scan
+
+### Version Detection
+Для каждого открытого порта отправляются protocol-specific probe:
+- **SSH** (22): отправка "SSH-2.0-PortScanner", парсинг ответа
+- **FTP** (21): команда FEAT (RFC 2389)
+- **HTTP** (80): HEAD запрос, парсинг Server header
+- **SMTP** (25): EHLO команда
+- **Memcached** (11211): команда "version"
+- Результаты кэшируются по ключу (host:port)
+
+### Banner Grabbing
+1. Подключение к открытому порту
+2. Ожидание 500ms для автоматического баннера
+3. Возврат первой строки баннера (до 1024 байт)
+
+### Экспорт в JSON
+- Ручная сериализация без внешних зависимостей
+- Включает scan_info, hosts (с портами, версиями, баннерами), summary
+- Экранирование специальных символов в строках
 
 ## Технические детали
 
-- Используются системные вызовы `socket()`, `connect()`, `setsockopt()` для установки таймаута
-- Для разрешения имён используется `getaddrinfo()`
-- Синхронизация доступа к очереди портов, результатам и выводу через mutex
-- Атомарные переменные для отслеживания прогресса
-- Поддержка комментариев в файлах (строки начинающиеся с `#` игнорируются)
+- **SYN Scan**: raw sockets (IPPROTO_TCP), manual TCP header construction, RFC 793 checksum
+- **Connect Scan**: standard socket()+connect() with SO_RCVTIMEO/SO_SNDTIMEO
+- **DNS Resolution**: getaddrinfo() with AF_INET
+- **Thread Safety**: mutex для очереди, результатов, вывода; atomic для прогресса
+- **Cross-platform**: macOS compatible (SO_CONNECT_TIME fallback для raw sockets)
 
 ## Использование в Flutter
 

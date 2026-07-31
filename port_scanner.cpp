@@ -434,18 +434,61 @@ private:
         switch (port) {
             case 21: { // FTP - FEAT command (RFC 2389)
                 send(sock, "FEAT\r\n", 6, 0);
-                usleep(500000); // Wait 500ms
+                usleep(500000);
                 ssize_t received = recv(sock, buffer, sizeof(buffer) - 1, 0);
                 if (received > 0) {
                     buffer[received] = '\0';
-                    // Extract version from banner like "220 (vsFTPd 3.0.3)"
+                    // Extract version from FEAT response or banner
+                    std::string resp(buffer);
+                    // Parse "211-Features:\n ... \n211 End" or 220 banner
                     if (strstr(buffer, "vsFTPd")) {
-                        version = "vsFTPd";
+                        // Extract version like "vsFTPd 3.0.3"
+                        char* p = strstr(buffer, "vsFTPd");
+                        if (p) {
+                            char* end = strchr(p + 6, '\n');
+                            if (end) {
+                                version.assign(p, end);
+                            } else {
+                                version = p;
+                            }
+                            // Trim to just "vsFTPd X.X.X"
+                            size_t space = version.find(' ', 6);
+                            if (space != std::string::npos && space < 30) {
+                                version = version.substr(0, space + 8);
+                            }
+                        }
                     } else if (strstr(buffer, "ProFTPD")) {
-                        version = "ProFTPD";
-                    } else if (strstr(buffer, "FTP")) {
-                        version = "FTP";
+                        char* p = strstr(buffer, "ProFTPD");
+                        if (p) {
+                            size_t space = strlen("ProFTPD");
+                            size_t end = strcspn(p + space, " \t\n");
+                            version.assign(p, space + end);
+                        }
+                    } else {
+                        // Try to extract from 220 banner: "220 (vsFTPd 3.0.3) Ready"
+                        char* banner220 = strstr(buffer, "220 ");
+                        if (banner220) {
+                            std::string bline(banner220 + 4);
+                            // Remove parentheses
+                            size_t p1 = bline.find('(');
+                            size_t p2 = bline.find(')');
+                            if (p1 != std::string::npos && p2 != std::string::npos && p2 > p1) {
+                                version = bline.substr(p1 + 1, p2 - p1 - 1);
+                            } else {
+                                // Take first line without the 220 prefix
+                                size_t nl = bline.find('\n');
+                                if (nl != std::string::npos) {
+                                    bline = bline.substr(0, nl);
+                                }
+                                // Trim \r
+                                if (!bline.empty() && bline.back() == '\r') {
+                                    bline.pop_back();
+                                }
+                                version = bline;
+                            }
+                        }
                     }
+                    if (version.empty()) version = "FTP";
                 }
                 break;
             }
@@ -455,13 +498,27 @@ private:
                 ssize_t received = recv(sock, buffer, sizeof(buffer) - 1, 0);
                 if (received > 0) {
                     buffer[received] = '\0';
-                    // Parse SSH banner like "SSH-2.0-OpenSSH_8.9p1"
+                    // Parse SSH banner like "SSH-2.0-OpenSSH_8.9p1" or "SSH-2.0-OpenSSH_7.4"
                     std::string resp(buffer);
-                    size_t dash = resp.find('-');
-                    if (dash != std::string::npos) {
-                        version = resp.substr(dash + 1, resp.find('\n') - dash - 1);
-                        if (version.empty()) version = resp.substr(dash + 1);
+                    if (resp.substr(0, 8) == "SSH-2.0-") {
+                        version = resp.substr(8);
+                        // Remove trailing \r\n
+                        while (!version.empty() && (version.back() == '\r' || version.back() == '\n')) {
+                            version.pop_back();
+                        }
+                    } else {
+                        // Try to find SSH string in response
+                        size_t ssh_pos = resp.find("SSH-");
+                        if (ssh_pos != std::string::npos) {
+                            size_t end = resp.find('\n', ssh_pos);
+                            if (end != std::string::npos) {
+                                version = resp.substr(ssh_pos, end - ssh_pos);
+                            } else {
+                                version = resp.substr(ssh_pos);
+                            }
+                        }
                     }
+                    if (version.empty()) version = "SSH";
                 }
                 break;
             }
@@ -471,13 +528,37 @@ private:
                 ssize_t received = recv(sock, buffer, sizeof(buffer) - 1, 0);
                 if (received > 0) {
                     buffer[received] = '\0';
-                    if (strstr(buffer, "Postfix")) {
-                        version = "Postfix";
-                    } else if (strstr(buffer, "Exim")) {
-                        version = "Exim";
-                    } else if (strstr(buffer, "Microsoft")) {
-                        version = "Microsoft ESMTP";
+                    // Extract version from EHLO response or 220 banner
+                    std::string resp(buffer);
+                    // Check 220 banner first: "220 mail.example.com ESMTP Postfix"
+                    char* banner220 = strstr(buffer, "220 ");
+                    if (banner220) {
+                        std::string bline(banner220 + 4);
+                        size_t nl = bline.find('\n');
+                        if (nl != std::string::npos) {
+                            bline = bline.substr(0, nl);
+                        }
+                        // Remove \r
+                        if (!bline.empty() && bline.back() == '\r') {
+                            bline.pop_back();
+                        }
+                        // Extract service name
+                        if (strstr(bline.c_str(), "Postfix")) {
+                            version = "Postfix";
+                        } else if (strstr(bline.c_str(), "Exim")) {
+                            version = "Exim";
+                        } else if (strstr(bline.c_str(), "Microsoft")) {
+                            version = "Microsoft ESMTP";
+                        } else if (strstr(bline.c_str(), "Sendmail")) {
+                            version = "Sendmail";
+                        } else if (strstr(bline.c_str(), "Haraka")) {
+                            version = "Haraka";
+                        } else {
+                            // Try to extract version from the banner string
+                            version = bline;
+                        }
                     }
+                    if (version.empty()) version = "SMTP";
                 }
                 break;
             }
@@ -488,8 +569,10 @@ private:
                 ssize_t received = recv(sock, buffer, sizeof(buffer) - 1, 0);
                 if (received > 0) {
                     buffer[received] = '\0';
-                    // Extract Server header
+                    // Extract Server header from response
                     std::string resp(buffer);
+                    
+                    // First try Server header
                     size_t serverPos = resp.find("Server: ");
                     if (serverPos != std::string::npos) {
                         size_t start = serverPos + 8;
@@ -498,9 +581,47 @@ private:
                             version = resp.substr(start, end - start);
                         } else {
                             version = resp.substr(start);
+                            // Remove trailing \n
+                            if (!version.empty() && version.back() == '\n') {
+                                version.pop_back();
+                            }
+                        }
+                    }
+                    
+                    // If no Server header, try X-Powered-By
+                    if (version.empty()) {
+                        size_t poweredPos = resp.find("X-Powered-By:");
+                        if (poweredPos != std::string::npos) {
+                            size_t start = poweredPos + 13;
+                            size_t end = resp.find('\r', start);
+                            if (end != std::string::npos) {
+                                version = resp.substr(start, end - start);
+                            } else {
+                                version = resp.substr(start);
+                                if (!version.empty() && version.back() == '\n') {
+                                    version.pop_back();
+                                }
+                            }
+                            // Trim leading space
+                            if (!version.empty() && version[0] == ' ') {
+                                version = version.substr(1);
+                            }
+                        }
+                    }
+                    
+                    // Try to extract HTTP server version from status line
+                    // e.g., "HTTP/1.1 200 OK" or response containing "server:" (case-insensitive)
+                    if (version.empty()) {
+                        if (resp.find("nginx") != std::string::npos) {
+                            version = "nginx";
+                        } else if (resp.find("Apache") != std::string::npos) {
+                            version = "Apache";
+                        } else if (resp.find("IIS") != std::string::npos || resp.find("msedge") != std::string::npos) {
+                            version = "Microsoft-IIS";
                         }
                     }
                 }
+                if (version.empty()) version = "HTTP";
                 break;
             }
             case 11211: { // Memcached
@@ -513,9 +634,20 @@ private:
                     std::string resp(buffer);
                     size_t versionPos = resp.find("VERSION ");
                     if (versionPos != std::string::npos) {
-                        version = resp.substr(versionPos + 8, resp.find('\r', versionPos) - versionPos - 8);
+                        size_t start = versionPos + 8;
+                        size_t end = resp.find('\r', start);
+                        if (end != std::string::npos) {
+                            version = resp.substr(start, end - start);
+                        } else {
+                            version = resp.substr(start);
+                            // Remove trailing \n\r
+                            while (!version.empty() && (version.back() == '\r' || version.back() == '\n')) {
+                                version.pop_back();
+                            }
+                        }
                     }
                 }
+                if (version.empty()) version = "Memcached";
                 break;
             }
             default: {

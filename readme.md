@@ -70,6 +70,47 @@ g++ -std=c++17 -o port_scanner main.cpp -pthread
 ./port_scanner_cli --all-scans --host 192.168.1.1
 ```
 
+### SYN Scan
+
+SYN scan (также известный как "half-open scanning") — это более эффективный и менее заметный метод сканирования по сравнению с полным TCP подключением.
+
+**Принцип работы:**
+1. Отправляется TCP SYN пакет (запрос на установку соединения)
+2. Если порт открыт — целевой сервер отвечает SYN+ACK, сканер отправляет RST и разрывает соединение, не завершая 3-этапное рукопожатие
+3. Если порт закрыт — сервер отвечает RST
+4. Если межсетевой экран фильтрует — таймаут
+
+**Преимущества SYN scan:**
+- **Stealth**: не завершает TCP соединение, менее заметен в логах
+- **Скорость**: не требуется ожидание полного установления соединения
+- **Эффективность**: можно сканировать больше портов за единицу времени
+
+**Требования:**
+- **root** или Capability `CAP_NET_RAW` (Linux)
+- На macOS raw sockets работают иначе — автоматический fallback на connect scan
+
+**Использование:**
+
+```bash
+# Базовый SYN scan (требует sudo)
+sudo ./port_scanner_cli --syn --host 192.168.1.1 --range 1-1024
+
+# SYN scan с определением версий сервисов
+sudo ./port_scanner_cli --syn --version-detect --host example.com --range 1-1024
+
+# SYN scan со всеми проверками (version + banner grabbing)
+sudo ./port_scanner_cli --syn --all-scans --host target.com --range 1-65535
+
+# SYN scan с экспортом результатов
+sudo ./port_scanner_cli --syn --version-detect --banner-grab --json report.json --host target.com
+```
+
+**Fallback на Connect Scan:**
+Если у процесса нет прав на использование raw sockets, программа автоматически переключается на connect scan и выводит предупреждение:
+```
+[WARN] Raw sockets unavailable (need root/CAP_NET_RAW). Falling back to connect scan for target.com
+```
+
 ### Примеры
 
 Базовое сканирование:

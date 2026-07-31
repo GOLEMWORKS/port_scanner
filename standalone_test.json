@@ -1,0 +1,41 @@
+{
+  "scan_info": {
+    "scan_type": "connect",
+    "port_range": "7777-7777",
+    "timestamp": "2026-07-31T21:11:54Z",
+    "options": {
+      "version_detection": false,
+      "banner_grabbing": false,
+      "exploit_checks": false
+    }
+  },
+  "hosts": [
+    {
+      "address": "localhost",
+      "status": "online",
+      "ports": [
+        {
+          "port": 7777,
+          "protocol": "tcp",
+          "state": "open",
+          "service": "unknown",
+          "ssl": false,
+          "vulnerabilities": [
+            {
+              "name": "none",
+              "severity": 0,
+              "cve": null,
+              "description": null
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "summary": {
+    "total_hosts": 1,
+    "online_hosts": 1,
+    "total_open_ports": 1,
+    "vulnerable_ports": 0
+  }
+}

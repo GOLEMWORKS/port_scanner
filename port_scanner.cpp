@@ -8,6 +8,8 @@
 #include <cstring>
 #include <random>
 #include <map>
+#include <algorithm>
+#include <cstdio>
 #include <netdb.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -17,6 +19,7 @@
 #include <unistd.h>
 #include <errno.h>
 #include <sys/ioctl.h>
+#include <fcntl.h>
 
 #include "port_scanner.h"
 
@@ -87,6 +90,16 @@ struct InternalPortResult {
     std::string service;
     std::string version;
     std::string banner;
+    bool isSSL;
+    std::vector<std::string> vulnerabilities; // List of found vulnerability names
+};
+
+struct InternalExploitResult {
+    ExploitCheck type;
+    bool vulnerable;
+    std::string description;
+    std::string cve;
+    int severity;
 };
 
 class PortScanner {
@@ -107,12 +120,16 @@ private:
     std::mutex outputMutex;
 
     std::vector<InternalPortResult> results;
+    std::vector<InternalExploitResult> exploitResults;
     std::mutex resultsMutex;
     int totalTasks;
     
     bool useSYNScan;
+    bool enableUDPScan;
     bool enableVersionDetection;
     bool enableBannerGrabbing;
+    int rateLimitPPS; // packets per second (0 = unlimited)
+    ExploitCheck activeExploitCheck; // Current exploit check to perform
 
     static std::string getServiceName(int port) {
         switch (port) {
@@ -132,11 +149,20 @@ private:
             case 3389: return "RDP";
             case 5432: return "PostgreSQL";
             case 8080: return "HTTP-Proxy";
+            case 8443: return "HTTPS-Alt";
+            case 9050: return "Tor";
+            case 9150: return "Tor-Trans";
+            case 9151: return "Tor-Socks";
+            case 1080: return "SOCKS";
+            case 27017: return "MongoDB";
             default: return "unknown";
         }
     }
 
     bool isPortOpen(const std::string& host, int port) {
+        if (enableUDPScan) {
+            return isPortOpenUDP(host, port);
+        }
         if (useSYNScan) {
             return isPortOpenSYN(host, port);
         }
@@ -176,6 +202,108 @@ private:
         return result == 0;
     }
 
+#if defined(__APPLE__) || defined(__MACH__)
+    // macOS-specific scan using SO_CONNECT_TIME as fallback when raw sockets unavailable
+    // SO_CONNECT_TIME is only available on macOS/Darwin
+    // If not defined, use alternative approach with select()
+#ifndef SO_CONNECT_TIME
+#define SO_CONNECT_TIME 0x1021  // Fallback value if not defined
+#endif
+    
+    bool isPortOpenMACOS(const std::string& host, int port) {
+        sockaddr_in addr{};
+        addr.sin_family = AF_INET;
+        addr.sin_port = htons(port);
+
+        struct in_addr resolved_ip;
+        if (inet_pton(AF_INET, host.c_str(), &resolved_ip) <= 0) {
+            addrinfo hints{}, *result;
+            hints.ai_family = AF_INET;
+            hints.ai_socktype = SOCK_STREAM;
+            if (getaddrinfo(host.c_str(), nullptr, &hints, &result) != 0) {
+                return false;
+            }
+            resolved_ip = ((sockaddr_in*)result->ai_addr)->sin_addr;
+            freeaddrinfo(result);
+        }
+
+        addr.sin_addr = resolved_ip;
+
+        int sock = socket(AF_INET, SOCK_STREAM, 0);
+        if (sock < 0) {
+            return false;
+        }
+
+        // Set non-blocking mode for timeout handling
+        int flags = fcntl(sock, F_GETFL, 0);
+        fcntl(sock, F_SETFL, flags | O_NONBLOCK);
+
+        timeval tv{};
+        tv.tv_sec = timeoutMs / 1000;
+        tv.tv_usec = (timeoutMs % 1000) * 1000;
+        setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+        setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+
+        // Initiate non-blocking connect
+        int connectResult = connect(sock, (sockaddr*)&addr, sizeof(addr));
+        
+        if (connectResult == 0) {
+            // Connected immediately - port is open
+            close(sock);
+            return true;
+        }
+        
+        if (errno != EINPROGRESS && errno != EWOULDBLOCK) {
+            // Immediate error - port likely closed or host unreachable
+            close(sock);
+            return false;
+        }
+
+        // Wait for connection to complete using select()
+        fd_set write_fds;
+        FD_ZERO(&write_fds);
+        FD_SET(sock, &write_fds);
+
+        timeval selectTv{};
+        selectTv.tv_sec = timeoutMs / 1000;
+        selectTv.tv_usec = (timeoutMs % 1000) * 1000;
+        
+        int selectResult = select(sock + 1, nullptr, &write_fds, nullptr, &selectTv);
+        
+        if (selectResult <= 0) {
+            // Timeout or error - port closed or filtered
+            close(sock);
+            return false;
+        }
+
+        // Check SO_CONNECT_TIME to determine if connection succeeded
+        // On macOS: SO_CONNECT_TIME = 0 means just connected, large value = failed
+        int time_used = 0;
+        socklen_t time_len = sizeof(time_used);
+        bool connectTimeSupported = (getsockopt(sock, SOL_SOCKET, SO_CONNECT_TIME, &time_used, &time_len) == 0);
+        
+        if (connectTimeSupported) {
+            if (time_used == 0) {
+                // Connection just established successfully
+                close(sock);
+                return true;
+            }
+            // If time_used is very large, connection didn't complete
+            if (time_used > 1000000) {
+                close(sock);
+                return false;
+            }
+            // Otherwise connection was established at some point
+            close(sock);
+            return true;
+        }
+
+        // Fallback: if select succeeded, port is likely open
+        close(sock);
+        return true;
+    }
+#endif
+
     bool isPortOpenSYN(const std::string& host, int port) {
         // Resolve hostname to IP
         struct in_addr resolved_ip{};
@@ -193,13 +321,22 @@ private:
         // Try to create raw socket for SYN scan
         int sock = socket(AF_INET, SOCK_RAW, IPPROTO_TCP);
         if (sock < 0) {
-            // Graceful degradation: fallback to connect scan if no root privileges
+            // Graceful degradation: fallback strategy based on platform
             // SYN scan requires CAP_NET_RAW (Linux) or root/admin (macOS)
             std::lock_guard<std::mutex> lock(outputMutex);
+            
+#if defined(__APPLE__) || defined(__MACH__)
+            std::cout << "[WARN] Raw sockets unavailable on macOS. "
+                      << "Using SO_CONNECT_TIME fallback for " << host << std::endl << std::flush;
+            useSYNScan = false;
+            close(sock);
+            return isPortOpenMACOS(host, port);
+#else
             std::cout << "[WARN] Raw sockets unavailable (need root/CAP_NET_RAW). "
                       << "Falling back to connect scan for " << host << std::endl << std::flush;
-            useSYNScan = false; // Disable SYN scan for subsequent calls
+            useSYNScan = false;
             return isPortOpenConnect(host, port);
+#endif
         }
 
         // Set receive timeout
@@ -383,6 +520,9 @@ private:
         // For UDP, timeout usually means open/filtered
         return false; // Conservative: assume closed on timeout
     }
+
+    // Warning about slow UDP scan shown once per scan session
+    static const int MAX_UDP_PORTS_DEFAULT = 1024;
 
     std::map<std::string, std::string> versionCache;
 
@@ -650,6 +790,43 @@ private:
                 if (version.empty()) version = "Memcached";
                 break;
             }
+            case 27017: { // MongoDB
+                // MongoDB sends a greeting message on connect
+                // Simply wait for the response (no probe needed)
+                usleep(500000);
+                ssize_t received = recv(sock, buffer, sizeof(buffer) - 1, 0);
+                if (received > 0) {
+                    buffer[received] = '\0';
+                    // Look for version in greeting
+                    std::string resp(buffer, received);
+                    if (resp.find("MongoDB") != std::string::npos) {
+                        size_t pos = resp.find("MongoDB");
+                        // Extract version after "MongoDB "
+                        size_t space = resp.find(' ', pos + 7);
+                        if (space != std::string::npos) {
+                            version = resp.substr(pos, space - pos);
+                        } else {
+                            version = "MongoDB";
+                        }
+                    } else {
+                        // Try to extract version from "version" field
+                        size_t ver_pos = resp.find("\"version\":");
+                        if (ver_pos != std::string::npos) {
+                            size_t start = resp.find('"', ver_pos + 10);
+                            if (start != std::string::npos) {
+                                start++;
+                                size_t end = resp.find('"', start);
+                                if (end != std::string::npos) {
+                                    version = resp.substr(start, end - start);
+                                    version = "MongoDB " + version;
+                                }
+                            }
+                        }
+                    }
+                }
+                if (version.empty()) version = "MongoDB";
+                break;
+            }
             default: {
                 // Try to read any automatic banner
                 usleep(500000);
@@ -678,8 +855,14 @@ private:
         return version;
     }
 
+    static bool isSSLC_port(int port) {
+        return port == 443 || port == 993 || port == 995 ||
+               port == 465 || port == 587 || port == 8443 ||
+               port == 9994 || port == 2096 || port == 2095;
+    }
+
     std::string grabBanner(const std::string& host, int port) {
-        // Connect to port
+        // Resolve host
         sockaddr_in addr{};
         addr.sin_family = AF_INET;
         addr.sin_port = htons(port);
@@ -712,31 +895,218 @@ private:
             return "";
         }
 
-        // Wait for automatic banner
-        char buffer[1024]{};
-        usleep(500000); // Wait 500ms for banner
-        
-        ssize_t received = recv(sock, buffer, sizeof(buffer) - 1, 0);
-        close(sock);
+        std::string banner;
+        char buffer[2048]{};
 
-        if (received > 0) {
-            buffer[received] = '\0';
-            std::string resp(buffer);
-            
-            // Extract first line (most common banner format)
-            size_t newline = resp.find('\n');
-            if (newline != std::string::npos) {
-                return resp.substr(0, newline);
+        if (isSSLC_port(port)) {
+            // TLS/SSL port — send TLS ClientHello to trigger certificate exchange
+            uint8_t tls_client_hello[] = {
+                0x16, 0x03, 0x01, 0x00, 0xdc,
+                0x01, 0x00, 0x00, 0xd8, 0x03, 0x03,
+                // Random (32 bytes)
+                0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                0x00, // Session ID length
+                0x00, 0x02, // Cipher suites length (1 cipher: TLS_RSA_WITH_AES_128_CBC_SHA)
+                0x00, 0x2f,
+                0x01, 0x00, // Extensions length
+                0x00, 0x00, 0x00, 0x00, 0x00, // Empty extension list
+                // SNI extension
+                0x00, 0x00, 0x00, 0x0c, 0x00, 0x0a, 0x00, 0x01, 0x00, 0x00, 0x09, 0x74, 0x61, 0x72, 0x67, 0x65, 0x74, 0x2e, 0x63, 0x6f, 0x6d
+            };
+            send(sock, tls_client_hello, sizeof(tls_client_hello), 0);
+            usleep(500000);
+
+            ssize_t received = recv(sock, buffer, sizeof(buffer) - 1, 0);
+            if (received > 0) {
+                buffer[received] = '\0';
+
+                // Parse TLS handshake response to extract certificate info
+                // TLS Handshake: ContentType(1) + Length(2) + HandshakeType(1) + Length(3) + ...
+                // Certificate: HandshakeType(1) + Length(3) + CertLength(3) + Cert(Data)
+                std::string resp(buffer, received);
+
+                // Look for certificate data (ASN.1 DER format)
+                // Common patterns in certificate: Subject CN, Organization, etc.
+                // Search for "CN=" or "O=" in the binary data (they may appear as ASCII)
+                std::string cert_info;
+
+                // Extract Subject CN
+                size_t cn_pos = resp.find("CN = ");
+                if (cn_pos == std::string::npos) {
+                    cn_pos = resp.find("CN=");
+                }
+                if (cn_pos != std::string::npos) {
+                    size_t cn_end = resp.find(',', cn_pos);
+                    if (cn_end == std::string::npos) {
+                        cn_end = resp.find('\0', cn_pos);
+                    }
+                    if (cn_end != std::string::npos && cn_end > cn_pos) {
+                        cert_info = resp.substr(cn_pos + 4, cn_end - cn_pos - 4);
+                    } else {
+                        cert_info = resp.substr(cn_pos + 4, 64);
+                    }
+                }
+
+                // Extract Organization
+                if (cert_info.empty()) {
+                    size_t org_pos = resp.find("O = ");
+                    if (org_pos == std::string::npos) {
+                        org_pos = resp.find("O=");
+                    }
+                    if (org_pos != std::string::npos) {
+                        size_t org_end = resp.find(',', org_pos);
+                        if (org_end == std::string::npos) {
+                            org_end = resp.find('\0', org_pos);
+                        }
+                        if (org_end != std::string::npos && org_end > org_pos) {
+                            cert_info = resp.substr(org_pos + 2, org_end - org_pos - 2);
+                        }
+                    }
+                }
+
+                // Check for expired/self-signed indicators
+                if (resp.find("expired") != std::string::npos ||
+                    resp.find("EXPired") != std::string::npos) {
+                    cert_info += " [EXPIRED]";
+                }
+                if (resp.find("self-signed") != std::string::npos ||
+                    resp.find("Self Signed") != std::string::npos) {
+                    cert_info += " [SELF-SIGNED]";
+                }
+
+                // Check for weak key indicators
+                if (resp.find("RSA 1024") != std::string::npos ||
+                    resp.find("RSA 512") != std::string::npos) {
+                    cert_info += " [WEAK KEY]";
+                }
+
+                if (!cert_info.empty()) {
+                    banner = "SSL/TLS cert: CN=" + cert_info;
+                } else {
+                    banner = "SSL/TLS";
+                }
+
+                // Also capture raw TLS response for debugging (first 256 chars)
+                std::string raw_banner;
+                for (int i = 0; i < received && i < 256; i++) {
+                    char c = buffer[i];
+                    if (c >= 32 && c < 127) {
+                        raw_banner += c;
+                    } else {
+                        raw_banner += '.';
+                    }
+                }
+                if (!banner.empty() && raw_banner.find("SSL") == std::string::npos) {
+                    banner += " | " + raw_banner.substr(0, 80);
+                }
             }
-            
-            // Return entire response if no newline
-            return resp;
+        } else {
+            // Non-SSL port — wait for automatic banner
+            usleep(500000); // Wait 500ms
+
+            ssize_t received = recv(sock, buffer, sizeof(buffer) - 1, 0);
+            if (received > 0) {
+                buffer[received] = '\0';
+                std::string resp(buffer, received);
+
+                // For HTTP, also try sending a probe if no automatic banner
+                if (port == 80 && received < 10) {
+                    const char* probe = "GET / HTTP/1.0\r\nHost: target\r\n\r\n";
+                    send(sock, probe, strlen(probe), 0);
+                    usleep(500000);
+                    memset(buffer, 0, sizeof(buffer));
+                    received = recv(sock, buffer, sizeof(buffer) - 1, 0);
+                    if (received > 0) {
+                        buffer[received] = '\0';
+                        resp = std::string(buffer, received);
+                    }
+                }
+
+                // Extract first line as banner
+                size_t newline = resp.find('\n');
+                if (newline != std::string::npos) {
+                    banner = resp.substr(0, newline);
+                    if (!banner.empty() && banner.back() == '\r') {
+                        banner.pop_back();
+                    }
+                } else {
+                    // Return truncated response
+                    banner = resp.substr(0, std::min((int)resp.size(), 512));
+                }
+            }
         }
 
-        return "";
+        close(sock);
+        return banner;
+    }
+
+    bool detectSSL(const std::string& host, int port) {
+        if (!isSSLC_port(port)) {
+            return false;
+        }
+
+        sockaddr_in addr{};
+        addr.sin_family = AF_INET;
+        addr.sin_port = htons(port);
+
+        struct in_addr resolved_ip;
+        if (inet_pton(AF_INET, host.c_str(), &resolved_ip) <= 0) {
+            addrinfo hints{}, *result;
+            hints.ai_family = AF_INET;
+            hints.ai_socktype = SOCK_STREAM;
+            if (getaddrinfo(host.c_str(), nullptr, &hints, &result) != 0) {
+                return false;
+            }
+            addr.sin_addr = ((sockaddr_in*)result->ai_addr)->sin_addr;
+            freeaddrinfo(result);
+        }
+
+        int sock = socket(AF_INET, SOCK_STREAM, 0);
+        if (sock < 0) return false;
+
+        timeval tv{};
+        tv.tv_sec = timeoutMs / 1000;
+        tv.tv_usec = (timeoutMs % 1000) * 1000;
+        setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+        if (connect(sock, (sockaddr*)&addr, sizeof(addr)) != 0) {
+            close(sock);
+            return false;
+        }
+
+        // Send TLS ClientHello
+        char tls_hello[] = {
+            0x16, 0x03, 0x01, 0x00, 0x40,
+            0x01, 0x00, 0x00, 0x3c, 0x03, 0x03,
+            0x00, 0x01, 0x02, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00
+        };
+        send(sock, tls_hello, sizeof(tls_hello), 0);
+        usleep(300000);
+
+        char response[64]{};
+        ssize_t received = recv(sock, response, sizeof(response), 0);
+        close(sock);
+
+        // If we get a TLS handshake response (0x16), port is SSL
+        return (received > 0 && ((uint8_t*)response)[0] == 0x16);
     }
 
     void workerThread() {
+        // Rate limiting: track last send time
+        std::chrono::steady_clock::time_point lastSendTime = std::chrono::steady_clock::now();
+        std::chrono::microseconds intervalBetweenPackets = std::chrono::microseconds(0);
+        
+        if (rateLimitPPS > 0) {
+            intervalBetweenPackets = std::chrono::microseconds(1000000 / rateLimitPPS);
+        }
+
         while (true) {
             std::pair<std::string, int> task;
             {
@@ -751,7 +1121,21 @@ private:
                 workQueue.pop_back();
             }
 
+            // Rate limiting: wait if needed
+            if (rateLimitPPS > 0) {
+                auto now = std::chrono::steady_clock::now();
+                auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(now - lastSendTime);
+                if (elapsed < intervalBetweenPackets) {
+                    auto waitTime = intervalBetweenPackets - elapsed;
+                    std::this_thread::sleep_for(waitTime);
+                }
+                lastSendTime = std::chrono::steady_clock::now();
+            }
+
             bool isOpen = isPortOpen(task.first, task.second);
+            
+            // Detect SSL/TLS for common ports
+            bool isSSL = isOpen && detectSSL(task.first, task.second);
             
             {
                 std::lock_guard<std::mutex> lock(resultsMutex);
@@ -759,6 +1143,7 @@ private:
                 pr.host = task.first;
                 pr.port = task.second;
                 pr.isOpen = isOpen;
+                pr.isSSL = isSSL;
                 pr.service = getServiceName(task.second);
                 
                 // Run version detection if enabled
@@ -769,6 +1154,11 @@ private:
                 // Run banner grabbing if enabled
                 if (isOpen && enableBannerGrabbing) {
                     pr.banner = grabBanner(task.first, task.second);
+                }
+                
+                // Run exploit check if enabled
+                if (isOpen && activeExploitCheck != EXPLOIT_NONE) {
+                    runExploitCheck(task.first, task.second, pr);
                 }
                 
                 results.push_back(pr);
@@ -786,64 +1176,56 @@ private:
         }
     }
 
-    void scanHost(const std::string& host, int hostIndex) {
-        bool hasOpenPort = false;
-        bool gotResponse = false;
-        
-        for (int port = startPort; port <= endPort; port++) {
-            if (isPortOpen(host, port)) {
-                hasOpenPort = true;
-                gotResponse = true;
-                break;
-            }
-            
-            std::this_thread::sleep_for(std::chrono::milliseconds(10));
-            
-            if (port >= startPort + 5) {
-                gotResponse = true;
-            }
-            
-            if (port % 10 == 0 && !gotResponse) {
-                std::lock_guard<std::mutex> lock(outputMutex);
-                std::cout << "[" << host << "] [OFFLINE]" << std::endl << std::flush;
-                hostStatus[hostIndex] = INTERNAL_HOST_STATUS_OFFLINE;
-                offlineHostsCount++;
-                return;
-            }
-        }
-        
-        if (hasOpenPort) {
-            std::lock_guard<std::mutex> lock(outputMutex);
-            std::cout << "[" << host << "] [ONLINE]" << std::endl << std::flush;
-            hostStatus[hostIndex] = INTERNAL_HOST_STATUS_ONLINE;
-        } else if (gotResponse) {
-            std::lock_guard<std::mutex> lock(outputMutex);
-            std::cout << "[" << host << "] [NO-PORTS]" << std::endl << std::flush;
-            hostStatus[hostIndex] = INTERNAL_HOST_STATUS_NO_PORTS;
-            noPortsHostsCount++;
-        } else {
-            std::lock_guard<std::mutex> lock(outputMutex);
-            std::cout << "[" << host << "] [OFFLINE]" << std::endl << std::flush;
-                hostStatus[hostIndex] = INTERNAL_HOST_STATUS_OFFLINE;
-            offlineHostsCount++;
-        }
-    }
-
     void printProgress() {
-        if (totalTasks == 0) return;
+        if (totalTasks <= 0) return;
         int lastProgress = -1;
         while (true) {
-            int progress = (completedTasks.load() * 100) / totalTasks;
+            int completed = completedTasks.load();
+            if (completed >= totalTasks) break;
+            int progress = (completed * 100) / totalTasks;
             if (progress != lastProgress) {
                 std::cout << "\rProgress: " << progress << "% (" 
-                          << completedTasks.load() << "/" << totalTasks << ")\r"
+                          << completed << "/" << totalTasks << ")\r"
                           << std::flush;
                 lastProgress = progress;
             }
-            if (completedTasks.load() >= totalTasks) break;
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
         }
+        // Print final progress
+        std::cout << "\rProgress: 100% (" << totalTasks << "/" << totalTasks << ")\r" << std::flush;
         std::cout << std::endl;
+    }
+
+    void updateHostStatuses() {
+        // After scan completes, update host statuses based on results
+        for (size_t h = 0; h < hosts.size(); h++) {
+            bool hasOpenPort = false;
+            for (const auto& r : results) {
+                if (r.host == hosts[h] && r.isOpen) {
+                    hasOpenPort = true;
+                    break;
+                }
+            }
+            
+            if (hasOpenPort) {
+                hostStatus[h] = INTERNAL_HOST_STATUS_ONLINE;
+            } else {
+                // Try to determine if host responded at all
+                // Check if any port was scanned for this host
+                bool wasScanned = false;
+                for (const auto& r : results) {
+                    if (r.host == hosts[h]) {
+                        wasScanned = true;
+                        break;
+                    }
+                }
+                if (wasScanned) {
+                    hostStatus[h] = INTERNAL_HOST_STATUS_NO_PORTS;
+                } else {
+                    hostStatus[h] = INTERNAL_HOST_STATUS_OFFLINE;
+                }
+            }
+        }
     }
 
 public:
@@ -851,7 +1233,9 @@ public:
                 int timeoutMs, int maxThreads)
         : hosts(hosts), startPort(startPort), endPort(endPort),
           timeoutMs(timeoutMs), maxThreads(maxThreads),
-          useSYNScan(false), enableVersionDetection(false), enableBannerGrabbing(false) {
+          useSYNScan(false), enableUDPScan(false),
+          enableVersionDetection(false), enableBannerGrabbing(false),
+          rateLimitPPS(0), activeExploitCheck(EXPLOIT_NONE) {
         hostStatus.resize(hosts.size(), INTERNAL_HOST_STATUS_OFFLINE);
     }
 
@@ -864,36 +1248,47 @@ public:
         std::cout << "Timeout: " << timeoutMs << "ms, Threads: " << maxThreads << std::endl;
         std::cout << "----------------------------------------" << std::endl;
 
-        for (size_t i = 0; i < hosts.size(); i++) {
-            scanHost(hosts[i], i);
-        }
-
-        for (size_t i = 0; i < hosts.size(); i++) {
-            if (hostStatus[i] == INTERNAL_HOST_STATUS_ONLINE || hostStatus[i] == INTERNAL_HOST_STATUS_NO_PORTS) {
-                for (int port = startPort; port <= endPort; port++) {
-                    workQueue.push_back({hosts[i], port});
-                }
+        // Fill work queue with all host:port combinations
+        for (const auto& host : hosts) {
+            for (int port = startPort; port <= endPort; port++) {
+                workQueue.push_back({host, port});
             }
         }
 
-        totalTasks = workQueue.size();
+        totalTasks = static_cast<int>(workQueue.size());
         completedTasks = 0;
+        openPortsCount = 0;
+        noPortsHostsCount = 0;
+        offlineHostsCount = 0;
 
+        // Start progress thread
         std::thread progressThread(&PortScanner::printProgress, this);
 
+        // Start worker threads
         for (int i = 0; i < maxThreads; i++) {
             threads.emplace_back(&PortScanner::workerThread, this);
         }
 
+        // Wait for workers
         for (auto& t : threads) {
             t.join();
         }
+        threads.clear();
 
+        // Wait for progress thread
         progressThread.join();
+
+        // Update host statuses based on results
+        updateHostStatuses();
+
+        int onlineCount = 0;
+        for (const auto& s : hostStatus) {
+            if (s == INTERNAL_HOST_STATUS_ONLINE) onlineCount++;
+        }
 
         std::cout << "----------------------------------------" << std::endl;
         std::cout << "Scan complete. Found " << openPortsCount.load() 
-                  << " open port(s). " << (hosts.size() - noPortsHostsCount.load() - offlineHostsCount.load())
+                  << " open port(s). " << onlineCount
                   << " ONLINE, " << noPortsHostsCount.load() << " NO-PORTS, "
                   << offlineHostsCount.load() << " OFFLINE host(s)." << std::endl;
     }
@@ -935,7 +1330,265 @@ public:
         return enableBannerGrabbing;
     }
 
+    void setUDPScan(bool enable) { enableUDPScan = enable; }
+    void setVersionDetection(bool enable) { enableVersionDetection = enable; }
+    void setBannerGrabbing(bool enable) { enableBannerGrabbing = enable; }
+    void setRateLimit(int pps) { rateLimitPPS = pps; }
+    void setExploitCheck(ExploitCheck check) { activeExploitCheck = check; }
+    ExploitCheck getExploitCheck() const { return activeExploitCheck; }
+
+    // ==================== Exploit Checks ====================
+    
+    bool checkHeartbleed(const std::string& host, int port) {
+        // CVE-2014-0160: OpenSSL Heartbleed Bug
+        // Only applicable to port 443 (HTTPS)
+        if (port != 443) return false;
+        
+        sockaddr_in addr{};
+        addr.sin_family = AF_INET;
+        addr.sin_port = htons(port);
+        
+        struct in_addr resolved_ip;
+        if (inet_pton(AF_INET, host.c_str(), &resolved_ip) <= 0) {
+            addrinfo hints{}, *result;
+            hints.ai_family = AF_INET;
+            hints.ai_socktype = SOCK_STREAM;
+            if (getaddrinfo(host.c_str(), nullptr, &hints, &result) != 0) {
+                return false;
+            }
+            resolved_ip = ((sockaddr_in*)result->ai_addr)->sin_addr;
+            freeaddrinfo(result);
+        }
+        addr.sin_addr = resolved_ip;
+        
+        int sock = socket(AF_INET, SOCK_STREAM, 0);
+        if (sock < 0) return false;
+        
+        timeval tv{};
+        tv.tv_sec = timeoutMs / 1000;
+        tv.tv_usec = (timeoutMs % 1000) * 1000;
+        setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+        setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+        
+        if (connect(sock, (sockaddr*)&addr, sizeof(addr)) != 0) {
+            close(sock);
+            return false;
+        }
+        
+        // Send TLS ClientHello to establish connection
+        uint8_t client_hello[] = {
+            0x16, 0x03, 0x01, 0x00, 0xdc,
+            0x01, 0x00, 0x00, 0xd8, 0x03, 0x03,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, // Session ID length
+            0x00, 0x02, // Cipher suites length
+            0x00, 0x2f, // TLS_RSA_WITH_AES_128_CBC_SHA
+            0x01, 0x00, // Extensions length
+            0x00, 0x00, 0x00, 0x00, 0x00 // Empty extension list
+        };
+        send(sock, client_hello, sizeof(client_hello), 0);
+        usleep(200000);
+        
+        // Send Heartbeat request (RFC 6520)
+        // Type=1 (heartbeat request), Payload length=0x4000 (16384, larger than actual payload)
+        uint8_t heartbeat[] = {
+            0x18, 0x03, 0x01, 0x00, 0x03,  // TLS record: ContentType=24(0x18), Version=3.1
+            0x01,                            // Handshake type=15 (Heartbeat)
+            0x00, 0x00, 0x00, 0x03,        // Handshake length
+            0x01,                          // Heartbeat type=1 (request)
+            0x00, 0x40,                    // Payload length=64 (we claim 64 bytes)
+            0x41, 0x41, 0x41, 0x41, 0x41, 0x41, 0x41, 0x41, // 8 bytes of payload
+            0x41, 0x41, 0x41, 0x41, 0x41, 0x41, 0x41, 0x41,
+            0x41, 0x41, 0x41, 0x41, 0x41, 0x41, 0x41, 0x41,
+            0x41, 0x41, 0x41, 0x41, 0x41, 0x41, 0x41, 0x41,
+            0x41, 0x41, 0x41, 0x41, 0x41, 0x41, 0x41, 0x41,
+            0x41, 0x41, 0x41, 0x41, 0x41, 0x41, 0x41, 0x41,
+            0x41, 0x41, 0x41, 0x41, 0x41, 0x41, 0x41, 0x41,
+            0x41, 0x41, 0x41, 0x41, 0x41, 0x41, 0x41, 0x41,
+            0x41, 0x41, 0x41, 0x41, 0x41, 0x41, 0x41, 0x41  // 32 bytes total
+        };
+        
+        send(sock, heartbeat, sizeof(heartbeat), 0);
+        usleep(200000);
+        
+        // Read response
+        char response[4096]{};
+        ssize_t received = recv(sock, response, sizeof(response), 0);
+        close(sock);
+        
+        // If we received more data than expected ( > 32 bytes payload), vulnerable
+        // TLS header (5) + Heartbeat header (7) + Payload(32) = 44 bytes minimum
+        // If vulnerable, server sends back 64 bytes of memory content
+        return (received > 50); // Heuristic: received more than expected
+    }
+    
+    bool checkShellshock(const std::string& host, int port) {
+        // CVE-2014-6271: Bash Remote Code Execution via Environment Variables
+        // Check on HTTP (80) and HTTPS (443) ports for CGI scripts
+        
+        sockaddr_in addr{};
+        addr.sin_family = AF_INET;
+        addr.sin_port = htons(port);
+        
+        struct in_addr resolved_ip;
+        if (inet_pton(AF_INET, host.c_str(), &resolved_ip) <= 0) {
+            addrinfo hints{}, *result;
+            hints.ai_family = AF_INET;
+            hints.ai_socktype = SOCK_STREAM;
+            if (getaddrinfo(host.c_str(), nullptr, &hints, &result) != 0) {
+                return false;
+            }
+            resolved_ip = ((sockaddr_in*)result->ai_addr)->sin_addr;
+            freeaddrinfo(result);
+        }
+        addr.sin_addr = resolved_ip;
+        
+        int sock = socket(AF_INET, SOCK_STREAM, 0);
+        if (sock < 0) return false;
+        
+        timeval tv{};
+        tv.tv_sec = timeoutMs / 1000;
+        tv.tv_usec = (timeoutMs % 1000) * 1000;
+        setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+        setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+        
+        if (connect(sock, (sockaddr*)&addr, sizeof(addr)) != 0) {
+            close(sock);
+            return false;
+        }
+        
+        // Shellshock payload in User-Agent
+        std::string request = "GET /cgi-bin/test HTTP/1.1\r\n"
+                             "Host: " + host + "\r\n"
+                             "User-Agent: () { :;}; echo VULNERABLE\r\n"
+                             "Connection: close\r\n\r\n";
+        
+        send(sock, request.c_str(), request.size(), 0);
+        usleep(300000);
+        
+        char buffer[2048]{};
+        ssize_t received = recv(sock, buffer, sizeof(buffer) - 1, 0);
+        close(sock);
+        
+        if (received > 0) {
+            buffer[received] = '\0';
+            return (strstr(buffer, "VULNERABLE") != nullptr);
+        }
+        return false;
+    }
+    
+    bool checkPolecache(const std::string& host, int port) {
+        // Memcached unauthorized access (no CVE, port 11211)
+        if (port != 11211) return false;
+        
+        sockaddr_in addr{};
+        addr.sin_family = AF_INET;
+        addr.sin_port = htons(port);
+        
+        struct in_addr resolved_ip;
+        if (inet_pton(AF_INET, host.c_str(), &resolved_ip) <= 0) {
+            addrinfo hints{}, *result;
+            hints.ai_family = AF_INET;
+            hints.ai_socktype = SOCK_DGRAM;
+            if (getaddrinfo(host.c_str(), nullptr, &hints, &result) != 0) {
+                return false;
+            }
+            resolved_ip = ((sockaddr_in*)result->ai_addr)->sin_addr;
+            freeaddrinfo(result);
+        }
+        addr.sin_addr = resolved_ip;
+        
+        int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+        if (sock < 0) return false;
+        
+        timeval tv{};
+        tv.tv_sec = timeoutMs / 1000;
+        tv.tv_usec = (timeoutMs % 1000) * 1000;
+        setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+        
+        // Send "stats\r\n" command
+        const char* cmd = "stats\r\n";
+        sendto(sock, cmd, strlen(cmd), 0, (sockaddr*)&addr, sizeof(addr));
+        
+        char response[1024]{};
+        sockaddr_in from_addr{};
+        socklen_t from_len = sizeof(from_addr);
+        ssize_t received = recvfrom(sock, response, sizeof(response) - 1, 0, 
+                                     (sockaddr*)&from_addr, &from_len);
+        close(sock);
+        
+        if (received > 0) {
+            response[received] = '\0';
+            // Memcached responds with stats if accessible
+            return (strstr(response, "STAT ") != nullptr);
+        }
+        return false;
+    }
+    
+    void runExploitCheck(const std::string& host, int port, InternalPortResult& result) {
+        if (activeExploitCheck == EXPLOIT_NONE) return;
+        if (!result.isOpen) return;
+        
+        bool vulnerable = false;
+        std::string vulnName;
+        
+        switch (activeExploitCheck) {
+            case EXPLOIT_HEARTBLEED:
+                vulnerable = checkHeartbleed(host, port);
+                vulnName = "Heartbleed (CVE-2014-0160)";
+                break;
+            case EXPLOIT_SHELLSHOCK:
+                vulnerable = checkShellshock(host, port);
+                vulnName = "Shellshock (CVE-2014-6271)";
+                break;
+            case EXPLOIT_POLECACHE:
+                vulnerable = checkPolecache(host, port);
+                vulnName = "PoleCache (Memcached Unauthorized Access)";
+                break;
+            default:
+                break;
+        }
+        
+        if (vulnerable) {
+            result.vulnerabilities.push_back(vulnName);
+            
+            // Add to exploit results
+            InternalExploitResult exploitResult;
+            exploitResult.type = activeExploitCheck;
+            exploitResult.vulnerable = true;
+            exploitResult.description = vulnName;
+            exploitResult.severity = 5; // Critical
+            
+            switch (activeExploitCheck) {
+                case EXPLOIT_HEARTBLEED:
+                    exploitResult.cve = "CVE-2014-0160";
+                    exploitResult.description = "OpenSSL Heartbleed allows reading 64KB of memory";
+                    break;
+                case EXPLOIT_SHELLSHOCK:
+                    exploitResult.cve = "CVE-2014-6271";
+                    exploitResult.description = "Bash Remote Code Execution via environment variables";
+                    break;
+                case EXPLOIT_POLECACHE:
+                    exploitResult.cve = "N/A";
+                    exploitResult.description = "Memcached exposed without authentication";
+                    exploitResult.severity = 4; // High
+                    break;
+                default:
+                    break;
+            }
+            
+            {
+                std::lock_guard<std::mutex> lock(resultsMutex);
+                exploitResults.push_back(exploitResult);
+            }
+        }
+    }
+
     std::string getScanTypeString() const {
+        if (enableUDPScan) return "udp";
         return useSYNScan ? "syn" : "connect";
     }
 
@@ -943,6 +1596,9 @@ public:
     int getEndPort() const { return endPort; }
     size_t getHostCount() const { return hosts.size(); }
 };
+
+// Static member definition
+const int PortScanner::MAX_UDP_PORTS_DEFAULT;
 
 struct CPortResult {
     char* host;
@@ -1009,10 +1665,10 @@ void scanner_scan(ScannerWrapper* scanner) {
         pr.port = r.port;
         pr.is_open = r.isOpen ? 1 : 0;
         pr.is_udp = 0;
-        pr.service = strdup(r.service.c_str());
-        pr.version = nullptr;
-        pr.banner = nullptr;
-        pr.ssl = 0;
+        pr.ssl = r.isSSL ? 1 : 0;
+        pr.service = r.service.empty() ? nullptr : strdup(r.service.c_str());
+        pr.version = r.version.empty() ? nullptr : strdup(r.version.c_str());
+        pr.banner = r.banner.empty() ? nullptr : strdup(r.banner.c_str());
         scanner->portResults.push_back(pr);
     }
     
@@ -1025,6 +1681,11 @@ void scanner_scan(ScannerWrapper* scanner) {
 int scanner_get_result_count(ScannerWrapper* scanner) {
     if (!scanner) return 0;
     return static_cast<int>(scanner->portResults.size());
+}
+
+int scanner_get_host_count(ScannerWrapper* scanner) {
+    if (!scanner) return 0;
+    return static_cast<int>(scanner->hosts.size());
 }
 
 PortResult scanner_get_result(ScannerWrapper* scanner, int index) {
@@ -1057,7 +1718,7 @@ HostStatus scanner_get_host_status(ScannerWrapper* scanner, int index) {
     }
 }
 
-void scanner_free_result(CPortResult* result) {
+void scanner_free_result(PortResult* result) {
     if (!result) return;
     if (result->host) free(result->host);
     if (result->service) free(result->service);
@@ -1065,7 +1726,7 @@ void scanner_free_result(CPortResult* result) {
     if (result->banner) free(result->banner);
 }
 
-void scanner_free_results(CPortResult* results, int count) {
+void scanner_free_results(PortResult* results, int count) {
     if (!results || count <= 0) return;
     for (int i = 0; i < count; i++) {
         scanner_free_result(&results[i]);
@@ -1076,12 +1737,12 @@ void scanner_free_results(CPortResult* results, int count) {
 void scanner_set_scan_type(ScannerWrapper* wrapper, ScanType type) {
     if (!wrapper || !wrapper->scanner) return;
     wrapper->scanner->setSYNScan(type == SCAN_TYPE_SYN);
+    wrapper->scanner->setUDPScan(type == SCAN_TYPE_UDP);
 }
 
 void scanner_set_exploit_check(ScannerWrapper* wrapper, ExploitCheck check) {
-    // TODO: Implement exploit checks
-    (void)wrapper;
-    (void)check;
+    if (!wrapper || !wrapper->scanner) return;
+    wrapper->scanner->setExploitCheck(check);
 }
 
 void scanner_set_enable_version_detection(ScannerWrapper* wrapper, int enable) {
@@ -1095,9 +1756,8 @@ void scanner_set_enable_banner_grabbing(ScannerWrapper* wrapper, int enable) {
 }
 
 void scanner_set_rate_limit(ScannerWrapper* wrapper, int packets_per_sec) {
-    // TODO: Implement rate limiting
-    (void)wrapper;
-    (void)packets_per_sec;
+    if (!wrapper || !wrapper->scanner) return;
+    wrapper->scanner->setRateLimit(packets_per_sec);
 }
 
 char* scanner_export_json(ScannerWrapper* wrapper) {
@@ -1107,101 +1767,148 @@ char* scanner_export_json(ScannerWrapper* wrapper) {
 
     const auto& results = wrapper->portResults;
     const auto& statuses = wrapper->hostStatusValues;
+    const auto& hosts = wrapper->hosts;
     
-    auto jsonEscape = [](const std::string& s) -> std::string {
+    // JSON string escaping
+    auto jsonEscape = [](const char* s) -> std::string {
+        if (!s) return "";
         std::string result;
-        for (char c : s) {
+        for (const char* p = s; *p; ++p) {
+            char c = *p;
             switch (c) {
-                case '"': result += "\\\""; break;
+                case '"':  result += "\\\""; break;
                 case '\\': result += "\\\\"; break;
                 case '\n': result += "\\n"; break;
                 case '\r': result += "\\r"; break;
                 case '\t': result += "\\t"; break;
-                default: result += c;
+                case '\b': result += "\\b"; break;
+                case '\f': result += "\\f"; break;
+                default:
+                    if (static_cast<unsigned char>(c) < 0x20) {
+                        char buf[8];
+                        snprintf(buf, sizeof(buf), "\\u%04x", c);
+                        result += buf;
+                    } else {
+                        result += c;
+                    }
             }
         }
         return result;
     };
 
-    // Get current time
+    auto jsonEscapeStr = [&jsonEscape](const std::string& s) -> std::string {
+        return jsonEscape(s.c_str());
+    };
+
+    // Helper for optional string fields (null if empty)
+    auto jsonOptString = [&jsonEscape](const char* s) -> std::string {
+        if (!s || s[0] == '\0') return "null";
+        return "\"" + jsonEscape(s) + "\"";
+    };
+
+    // Get current time in ISO 8601 format
     char timeBuf[64];
     time_t now = time(nullptr);
     struct tm* tm_info = gmtime(&now);
     strftime(timeBuf, sizeof(timeBuf), "%Y-%m-%dT%H:%M:%SZ", tm_info);
 
-    std::string json = "{\n";
-    json += "  \"scan_info\": {\n";
-    json += "    \"scan_type\": \"" + wrapper->scanner->getScanTypeString() + "\",\n";
-    json += "    \"port_range\": \"" + std::to_string(wrapper->scanner->getStartPort()) + "-" + std::to_string(wrapper->scanner->getEndPort()) + "\",\n";
-    json += "    \"timestamp\": \"" + std::string(timeBuf) + "\",\n";
-    json += "    \"options\": {\n";
-    json += "      \"version_detection\": " + std::string(wrapper->scanner->getVersionDetectionEnabled() ? "true" : "false") + ",\n";
-    json += "      \"banner_grabbing\": " + std::string(wrapper->scanner->getBannerGrabbingEnabled() ? "true" : "false") + ",\n";
-    json += "      \"exploit_checks\": false\n";
-    json += "    }\n";
-    json += "  },\n";
-    json += "  \"hosts\": [\n";
-
+    // Count statistics
     int onlineHosts = 0;
     int totalOpenPorts = 0;
+    int vulnerablePorts = 0;
     
+    for (size_t h = 0; h < statuses.size(); h++) {
+        HostStatus status = scanner_get_host_status(wrapper, static_cast<int>(h));
+        if (status == HOST_STATUS_ONLINE) onlineHosts++;
+    }
+    
+    for (const auto& pr : results) {
+        if (pr.is_open != 0) {
+            totalOpenPorts++;
+        }
+    }
+
+    // Build JSON manually
+    std::string json;
+    json.reserve(4096); // Pre-allocate for efficiency
+
+    // === scan_info section ===
+    json += "{\n";
+    json += "  \"scan_info\": {\n";
+    json += "    \"scan_type\": \"" + jsonEscapeStr(wrapper->scanner->getScanTypeString()) + "\",\n";
+    json += "    \"port_range\": \"" + std::to_string(wrapper->scanner->getStartPort()) + "-" + 
+            std::to_string(wrapper->scanner->getEndPort()) + "\",\n";
+    json += "    \"timestamp\": \"" + std::string(timeBuf) + "\",\n";
+    json += "    \"scan_options\": {\n";
+    json += "      \"version_detection\": " + std::string(wrapper->scanner->getVersionDetectionEnabled() ? "true" : "false") + ",\n";
+    json += "      \"banner_grabbing\": " + std::string(wrapper->scanner->getBannerGrabbingEnabled() ? "true" : "false") + "\n";
+    json += "    }\n";
+    json += "  },\n";
+
+    // === hosts section ===
+    json += "  \"hosts\": [\n";
+
     for (size_t h = 0; h < statuses.size(); h++) {
         HostStatus status = scanner_get_host_status(wrapper, static_cast<int>(h));
         std::string statusStr;
         switch (status) {
-            case HOST_STATUS_ONLINE: statusStr = "online"; onlineHosts++; break;
-            case HOST_STATUS_NO_PORTS: statusStr = "no-ports"; break;
-            default: statusStr = "offline"; break;
+            case HOST_STATUS_ONLINE:   statusStr = "online"; break;
+            case HOST_STATUS_NO_PORTS: statusStr = "no-open-ports"; break;
+            default:                   statusStr = "offline"; break;
         }
 
         json += "    {\n";
-        json += "      \"address\": \"" + jsonEscape(wrapper->hosts[h]) + "\",\n";
+        json += "      \"address\": \"" + jsonEscape(hosts[h].c_str()) + "\",\n";
         json += "      \"status\": \"" + statusStr + "\",\n";
         json += "      \"ports\": [\n";
 
         bool firstPort = true;
-        int hostOpenPorts = 0;
         
+        // Collect all ports for this host (only open ports are interesting)
+        std::vector<const CPortResult*> hostPorts;
         for (const auto& pr : results) {
-            // Check if this result belongs to current host
             std::string hostStr(pr.host);
-            if (hostStr == wrapper->hosts[h]) {
-                if (!firstPort) json += ",\n";
-                firstPort = false;
-                
-                bool isOpen = pr.is_open != 0;
-                std::string service = pr.service ? pr.service : "unknown";
-                std::string version = pr.version ? pr.version : "";
-                std::string banner = pr.banner ? pr.banner : "";
-                bool ssl = pr.ssl != 0;
-                
-                json += "        {\n";
-                json += "          \"port\": " + std::to_string(pr.port) + ",\n";
-                json += "          \"protocol\": \"tcp\",\n";
-                json += "          \"state\": " + std::string(isOpen ? "\"open\"" : "\"closed\"") + ",\n";
-                json += "          \"service\": \"" + jsonEscape(service) + "\"";
-                
-                if (!version.empty()) {
-                    json += ",\n          \"version\": \"" + jsonEscape(version) + "\"";
-                }
-                if (!banner.empty()) {
-                    json += ",\n          \"banner\": \"" + jsonEscape(banner) + "\"";
-                }
-                json += ",\n          \"ssl\": " + std::string(ssl ? "true" : "false");
-                json += ",\n          \"vulnerabilities\": [\n            {\n";
-                json += "              \"name\": \"none\",\n";
-                json += "              \"severity\": 0,\n";
-                json += "              \"cve\": null,\n";
-                json += "              \"description\": null\n";
-                json += "            }\n";
-                json += "          ]\n";
-                json += "        }";
-                
-                if (isOpen) {
-                    totalOpenPorts++;
-                    hostOpenPorts++;
-                }
+            if (hostStr == hosts[h]) {
+                hostPorts.push_back(&pr);
             }
+        }
+
+        // Sort by port number
+        std::sort(hostPorts.begin(), hostPorts.end(),
+                  [](const CPortResult* a, const CPortResult* b) { return a->port < b->port; });
+
+        for (const auto* pr : hostPorts) {
+            if (!firstPort) json += ",\n";
+            firstPort = false;
+            
+            bool isOpen = pr->is_open != 0;
+            std::string protocol = "tcp"; // TCP is default
+            std::string state = isOpen ? "open" : (pr->is_udp != 0 ? "open|filtered" : "closed");
+            std::string service = pr->service ? pr->service : "unknown";
+            bool ssl = pr->ssl != 0;
+            
+            json += "        {\n";
+            json += "          \"port\": " + std::to_string(pr->port) + ",\n";
+            json += "          \"protocol\": \"" + protocol + "\",\n";
+            json += "          \"state\": \"" + state + "\",\n";
+            json += "          \"service\": \"" + jsonEscape(service.c_str()) + "\"";
+            
+            // Optional: version
+            if (pr->version) {
+                json += ",\n          \"version\": " + jsonOptString(pr->version);
+            }
+            
+            // Optional: banner
+            if (pr->banner) {
+                json += ",\n          \"banner\": " + jsonOptString(pr->banner);
+            }
+            
+            // SSL/TLS flag
+            json += ",\n          \"ssl\": " + std::string(ssl ? "true" : "false");
+            
+            // Vulnerabilities (placeholder for future exploit checks)
+            json += ",\n          \"vulnerabilities\": []\n";
+            json += "        }";
         }
 
         json += "\n      ]\n";
@@ -1211,26 +1918,91 @@ char* scanner_export_json(ScannerWrapper* wrapper) {
     }
 
     json += "  ],\n";
+
+    // === summary section ===
     json += "  \"summary\": {\n";
     json += "    \"total_hosts\": " + std::to_string(statuses.size()) + ",\n";
     json += "    \"online_hosts\": " + std::to_string(onlineHosts) + ",\n";
     json += "    \"total_open_ports\": " + std::to_string(totalOpenPorts) + ",\n";
-    json += "    \"vulnerable_ports\": 0\n";
+    json += "    \"vulnerable_ports\": " + std::to_string(vulnerablePorts) + "\n";
     json += "  }\n";
-    json += "}";
+    json += "}\n";
 
     return strdup(json.c_str());
 }
 
 ScanReport* scanner_get_report(ScannerWrapper* wrapper) {
-    // TODO: Implement report generation
-    (void)wrapper;
-    return nullptr;
+    if (!wrapper || !wrapper->scanner) {
+        return nullptr;
+    }
+
+    auto* report = new ScanReport();
+    
+    const auto& results = wrapper->portResults;
+    const auto& statuses = wrapper->hostStatusValues;
+    
+    report->host_count = static_cast<int>(statuses.size());
+    report->port_count = static_cast<int>(results.size());
+    report->open_count = 0;
+    report->vulnerable_count = 0;
+    
+    // Copy host statuses
+    report->host_statuses = new HostStatus[statuses.size()];
+    for (size_t i = 0; i < statuses.size(); i++) {
+        switch (statuses[i]) {
+            case INTERNAL_HOST_STATUS_ONLINE:   report->host_statuses[i] = HOST_STATUS_ONLINE; break;
+            case INTERNAL_HOST_STATUS_NO_PORTS: report->host_statuses[i] = HOST_STATUS_NO_PORTS; break;
+            default:                            report->host_statuses[i] = HOST_STATUS_OFFLINE; break;
+        }
+    }
+    
+    // Copy port results
+    report->results = new PortResult[results.size()];
+    for (size_t i = 0; i < results.size(); i++) {
+        const CPortResult& cr = results[i];
+        report->results[i].host = cr.host ? strdup(cr.host) : nullptr;
+        report->results[i].port = cr.port;
+        report->results[i].is_open = cr.is_open;
+        report->results[i].is_udp = cr.is_udp;
+        report->results[i].service = cr.service ? strdup(cr.service) : nullptr;
+        report->results[i].version = cr.version ? strdup(cr.version) : nullptr;
+        report->results[i].banner = cr.banner ? strdup(cr.banner) : nullptr;
+        report->results[i].ssl = cr.ssl;
+        
+        if (cr.is_open != 0) {
+            report->open_count++;
+        }
+    }
+    
+    // Exploit results (placeholder - not implemented yet)
+    report->exploit_results = nullptr;
+    
+    return report;
 }
 
 void scanner_free_report(ScanReport* report) {
-    // TODO: Implement report cleanup
-    (void)report;
+    if (!report) return;
+    
+    if (report->host_statuses) {
+        delete[] report->host_statuses;
+    }
+    
+    if (report->results) {
+        for (int i = 0; i < report->port_count; i++) {
+            if (report->results[i].host) free(report->results[i].host);
+            if (report->results[i].service) free(report->results[i].service);
+            if (report->results[i].version) free(report->results[i].version);
+            if (report->results[i].banner) free(report->results[i].banner);
+        }
+        delete[] report->results;
+    }
+    
+    if (report->exploit_results) {
+        // TODO: Free exploit results when implemented
+        delete[] report->exploit_results;
+    }
+    
+    delete report;
 }
 
 void scanner_free_json(char* json) {

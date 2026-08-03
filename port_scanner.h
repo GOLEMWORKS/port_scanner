@@ -208,6 +208,14 @@ void scanner_free_json(char* json);
  */
 void scanner_free_report(ScanReport* report);
 
+/* ==================== Network Discovery Module ==================== */
+
+/**
+ * Include the network discovery module declarations.
+ * Provides types and functions for network host discovery.
+ */
+#include "network_discovery.h"
+
 #ifdef __cplusplus
 }
 #endif

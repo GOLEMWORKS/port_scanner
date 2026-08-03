@@ -16,6 +16,7 @@
 - **Presets** — готовые профили сканирования (--quick, --stealth, --vuln, --full)
 - **Graceful Degradation** — автоматический fallback на connect scan если SYN недоступен
 - **Multi-threaded** — высокопроизводительное многопоточное сканирование
+- **Network Discovery** — автоматический поиск живых хостов в сети (CIDR scan, ARP, ping, reverse DNS)
 
 ## Компиляция
 
@@ -35,16 +36,16 @@ make -j8
 
 ```bash
 # macOS
-g++ -std=c++17 -shared -fPIC -o libport_scanner.dylib port_scanner.cpp -pthread
+g++ -std=c++17 -shared -fPIC -o libport_scanner.dylib port_scanner.cpp network_discovery.cpp -pthread
 
 # Linux
-g++ -std=c++17 -shared -fPIC -o libport_scanner.so port_scanner.cpp -pthread
+g++ -std=c++17 -shared -fPIC -o libport_scanner.so port_scanner.cpp network_discovery.cpp -pthread
 
 # Android arm64-v8a (через NDK)
 $NDK/toolchains/llvm/prebuilt/darwin-x86_64/bin/aarch64-linux-android21-clang++ \
   -std=c++17 -shared -fPIC \
   -o libport_scanner_arm64-v8a.so \
-  port_scanner.cpp -pthread
+  port_scanner.cpp network_discovery.cpp -pthread
 ```
 
 ## Использование
@@ -240,6 +241,103 @@ sudo ./port_scanner_cli --syn --rate-limit 10 --host target.com --range 1-1024
 ```bash
 # Включить все проверки
 sudo ./port_scanner_cli --all-scans --host target.com --range 1-1024
+```
+
+### Network Discovery Module
+
+Модуль обнаружения сетевых устройств находит живые хосты в локальной сети, извлекает их IP-адреса и hostnames. Результаты автоматически передаются в порт-сканер для последующего сканирования портов.
+
+**Принцип работы:**
+1. Парсинг CIDR-диапазона (например `192.168.1.0/24`)
+2. Параллельный PING всех IP в подсети (UDP ping + TCP ping fallback)
+3. Reverse DNS resolution для онлайн-хостов
+4. Автоматическая передача найденных хостов в сканер
+
+**Методы обнаружения:**
+
+| Метод | Описание | Работает без root | Работает на Android/iOS |
+|-------|----------|-------------------|-------------------------|
+| **UDP Ping** (port 9) | Основной метод — отправка UDP пакетов на порт discard | ✅ | ✅ |
+| **TCP Ping** | Fallback — connect() на порты 80/443/22 | ✅ | ✅ |
+| **ARP Scan** | Самый быстрый, только для локальной L2 сети | ❌ (требует root) | ❌ (нет raw sockets) |
+
+**CLI опции:**
+
+| Флаг | Описание |
+|------|----------|
+| `--discover <CIDR>` | Запустить обнаружение хостов в сети (например `192.168.1.0/24`) |
+| `--list-only` | Только вывести найденные хосты, без сканирования портов |
+| `--discover-threads <n>` | Количество потоков для discovery (по умолчанию: 50) |
+| `--discover-timeout <ms>` | Таймаут на хост в ms (по умолчанию: 500) |
+| `--json <file>` | Экспорт результатов discovery в JSON |
+
+**Примеры использования:**
+
+```bash
+# Обнаружить все хосты в локальной сети и распечатать их
+./port_scanner_cli --discover 192.168.1.0/24 --list-only
+
+# Обнаружить + автоматически просканировать порты на всех найденных хостах
+./port_scanner_cli --discover 192.168.1.0/24 --range 1-1024
+
+# Обнаружение + полный скан всех портов + экспортом в JSON
+sudo ./port_scanner_cli --discover 192.168.1.0/24 --all-scans --json full-network-report.json
+
+# Discovery с кастомными настройками производительности
+./port_scanner_cli --discover 192.168.1.0/24 --discover-threads 100 --discover-timeout 300 --list-only
+
+# Сканирование большой подсети /16 (65534 hosts)
+./port_scanner_cli --discover 10.0.0.0/16 --range 1-100 --discover-threads 100
+```
+
+**Пример вывода:**
+```
+Network Discovery: 192.168.1.0/24
+Progress: 45% (90/200 hosts discovered)
+
+Discovered hosts:
+  [1] 192.168.1.1 (router.local) — ONLINE
+  [2] 192.168.1.5 (nas.local) — ONLINE
+  [3] 192.168.1.12 (workstation.local) — ONLINE
+  [4] 192.168.1.25 (printer.local) — ONLINE
+  ...
+
+Starting port scan on 4 discovered hosts...
+```
+
+**Integration с Port Scanner:**
+- При указании `--discover` программа сначала находит хосты, затем автоматически запускает сканирование портов
+- Результаты discovery добавляются в JSON-экспорт в раздел `"discovery"`
+- Можно использовать `--list-only` только для разведки без сканирования
+
+**Dart FFI API:**
+
+```dart
+import 'port_scanner_ffi.dart';
+
+Future<void> discoverNetwork() async {
+  final lib = PortScannerLib();
+  await lib.load();
+  
+  // Создание discovery-сканера
+  final wrapper = lib.discoveryCreate('192.168.1.0/24', 500, 50);
+  
+  // Запуск обнаружения
+  lib.discoveryScan(wrapper);
+  
+  // Получение результатов
+  final onlineCount = lib.discoveryGetOnlineCount(wrapper);
+  print('Found $onlineCount online hosts');
+  
+  for (int i = 0; i < onlineCount; i++) {
+    final ip = lib.discoveryGetIp(wrapper, i);
+    final hostname = lib.discoveryGetHostname(wrapper, i);
+    print('  $ip ($hostname)');
+  }
+  
+  // Освобождение
+  lib.discoveryDestroy(wrapper);
+}
 ```
 
 ### Примеры
@@ -569,9 +667,13 @@ void processResults(ScannerWrapper scanner) {
 
 ```
 port_scanner/
-├── port_scanner.h          # C API header
+├── port_scanner.h          # C API header (scanner + discovery)
 ├── port_scanner.cpp        # Core library (scan, version, banner, JSON, exploits)
-├── port_scanner_cli.cpp    # CLI с парсингом аргументов
+├── network_discovery.h     # Network Discovery C API header
+├── network_discovery.cpp   # Network Discovery implementation (CIDR, ping, DNS)
+├── port_scanner_cli.cpp    # CLI с парсингом аргументов (+ --discover)
+├── port_scanner_ffi.dart   # Dart FFI bindings (+ DiscoveryLib)
+├── CMakeLists.txt          # Build configuration
 ├── libport_scanner.so      # Shared library (Linux/Android)
 ├── libport_scanner.dylib   # Shared library (macOS)
 ├── port_scanner_cli        # CLI executable
@@ -833,7 +935,7 @@ g++ -std=c++17 -shared -fPIC -o libport_scanner.dylib port_scanner.cpp -pthread
 $NDK/toolchains/llvm/prebuilt/darwin-x86_64/bin/aarch64-linux-android21-clang++ \
   -std=c++17 -shared -fPIC \
   -o libport_scanner_arm64-v8a.so \
-  port_scanner.cpp \
+  port_scanner.cpp network_discovery.cpp \
   -pthread
 ```
 
@@ -842,8 +944,17 @@ $NDK/toolchains/llvm/prebuilt/darwin-x86_64/bin/aarch64-linux-android21-clang++ 
 $NDK/toolchains/llvm/prebuilt/darwin-x86_64/bin/armv7a-linux-androideabi21-clang++ \
   -std=c++17 -shared -fPIC \
   -o libport_scanner_armeabi-v7a.so \
-  port_scanner.cpp \
+  port_scanner.cpp network_discovery.cpp \
   -pthread
+```
+
+**iOS arm64:**
+```bash
+xcrun --sdk iphoneos clang++ \
+  -std=c++17 -shared -fPIC \
+  -o libport_scanner_ios.so \
+  port_scanner.cpp network_discovery.cpp -pthread \
+  -arch arm64
 ```
 
 Рекомендуется настроить CMakeLists.txt для автоматической сборки под все целевые архитектуры.
@@ -880,6 +991,31 @@ char* scanner_export_json(ScannerWrapper* scanner);
 ScanReport* scanner_get_report(ScannerWrapper* scanner);    // ← новое
 void scanner_free_report(ScanReport* report);                // ← новое
 void scanner_free_json(char* json);
+
+// ===== Network Discovery Functions =====
+// Создание и уничтожение discovery-сканера
+DiscoveryWrapper* discovery_create(const char* network_cidr,
+                                    int timeout_ms, int max_threads);
+void discovery_destroy(DiscoveryWrapper* wrapper);
+
+// Сканирование
+void discovery_scan(DiscoveryWrapper* wrapper);
+
+// Настройки
+void discovery_set_type(DiscoveryWrapper* wrapper, DiscoveryType type);
+void discovery_set_enable_dns(DiscoveryWrapper* wrapper, int enable);
+
+// Получение результатов
+int discovery_get_total_scanned(DiscoveryWrapper* wrapper);
+int discovery_get_online_count(DiscoveryWrapper* wrapper);
+DiscoveryResult discovery_get_result(DiscoveryWrapper* wrapper, int index);
+const char* discovery_get_ip(DiscoveryWrapper* wrapper, int index);
+const char* discovery_get_hostname(DiscoveryWrapper* wrapper, int index);
+
+// Отчёт
+DiscoveryReport* discovery_get_report(DiscoveryWrapper* wrapper);
+void discovery_free_report(DiscoveryReport* report);
+void discovery_free_result(DiscoveryResult* result);
 ```
 
 ### Типы данных
@@ -913,11 +1049,67 @@ typedef struct {
     char* banner;    // Баннер сервиса (может быть NULL)
     int ssl;         // 1 если SSL/TLS детектирован
 } PortResult;
+
+// ===== Network Discovery Types =====
+
+/** DiscoveryType — метод обнаружения */
+typedef enum {
+    DISCOVERY_TYPE_PING = 0,          // ICMP Ping (basic liveness)
+    DISCOVERY_TYPE_PING_BROADCAST = 1, // ARP + ICMP + UDP ping
+    DISCOVERY_TYPE_ARP = 2            // ARP scan (fast, local network only)
+} DiscoveryType;
+
+/** DiscoveryResult — результат обнаружения хоста */
+typedef struct {
+    char* ip_address;    // IP адрес (malloc'd)
+    char* hostname;      // Имя хоста (malloc'd, может быть NULL)
+    int is_online;       // 1 = онлайн, 0 = оффлайн
+} DiscoveryResult;
+
+/** DiscoveryReport — отчёт discovery */
+typedef struct {
+    int total_scanned;           // Сколько IP просканировано
+    int online_count;            // Сколько найдено онлайн
+    int hostname_resolved;       // Сколько resolved до имён
+    DiscoveryResult* results;    // Массив результатов (malloc'd)
+} DiscoveryReport;
 ```
 
 ## Риски и платформы
 
-### 1. SYN scan требует root/CAP_NET_RAW (Linux)
+### 1. Network Discovery — особенности и риски
+
+**Проблема: Android/iOS не поддерживают raw sockets**
+
+Риск: ARP scan и ICMP raw sockets недоступны на Android и iOS.
+
+Смягчение: На мобильных платформах автоматически используется UDP ping (port 9) + TCP ping fallback + reverse DNS — всё работает без root и raw sockets.
+
+**Проблема: Большие подсети (/16, /8)**
+
+Риск: Сканирование 65534 хостов (/16) может занять значительное время.
+
+Смягчение:
+- `--discover-threads 100` для увеличения производительности
+- Progress bar показывает прогресс в реальном времени
+- Рекомендуется ограничивать сканирование портов
+
+**Проблема: Firewall блокирует ping**
+
+Риск: ICMP и UDP ping могут быть заблокированы межсетевым экраном.
+
+Смягчение: Автоматический fallback на TCP ping (ports 80/443/22) — если firewall пропускает HTTP/SSH, хост будет найден.
+
+**Проблема: Reverse DNS медленный**
+
+Риск: Reverse DNS resolution может занимать несколько секунд на хост.
+
+Смягчение:
+- Асинхронное выполнение в worker threads
+- Таймаут 500ms на resolution
+- Если DNS не отвечает, используется IP как hostname
+
+### 2. SYN scan требует root/CAP_NET_RAW (Linux)
 **Риск:** SYN scan использует raw sockets, которые требуют прав root или capability `CAP_NET_RAW`.
 
 **Смягчение:** Реализован graceful fallback — если raw sockets недоступны, автоматически переключается на connect scan с предупреждением:
@@ -934,7 +1126,7 @@ sudo ./port_scanner_cli --syn --host target.com
 sudo setcap cap_net_raw+ep ./port_scanner_cli
 ```
 
-### 2. macOS raw sockets (SO_CONNECT_TIME fallback)
+### 3. macOS raw sockets (SO_CONNECT_TIME fallback)
 **Риск:** На macOS raw sockets работают иначе и требуют повышенных привилегий.
 
 **Смягчение:** На macOS автоматически используется `SO_CONNECT_TIME` fallback — socket option, который позволяет определить открытость порта без raw sockets:
@@ -947,7 +1139,7 @@ sudo setcap cap_net_raw+ep ./port_scanner_cli
 - Менее точен чем raw socket SYN scan
 - Автоматически активируется при отсутствии прав
 
-### 3. UDP сканирование медленное
+### 4. UDP сканирование медленное
 **Риск:** UDP scan значительно медленнее TCP из-за необходимости ждать ответов или таймаутов.
 
 **Смягчение:**
@@ -968,7 +1160,7 @@ sudo setcap cap_net_raw+ep ./port_scanner_cli
 # Ошибка: UDP scan of all 65535 ports is not recommended
 ```
 
-### 4. JSON без внешних зависимостей
+### 5. JSON без внешних зависимостей
 **Риск:** Зависимости от внешних библиотек усложняют билд для Android/iOS.
 
 **Смягчение:** Ручная сериализация JSON (~150 строк) без внешних зависимостей:
@@ -977,7 +1169,7 @@ sudo setcap cap_net_raw+ep ./port_scanner_cli
 - Optional поля (version, banner) выводятся как `null`
 - Можно добавить nlohmann/json позже для расширенного функционала
 
-### 5. Android/iOS ABI compatibility
+### 6. Android/iOS ABI compatibility
 **Риск:** Изменение структуры C API ломает совместимость с существующими приложениями.
 
 **Смягчение:**

@@ -1,1 +1,28 @@
-/.vscode
+# Build directory
+build/
+
+# IDE config files
+.vscode/
+.gigacode_vsc/
+.idea/
+*.swp
+*.swo
+*~
+
+# Compiled binaries (OS-specific)
+*.o
+*.so.*
+*.dylib
+*.dSYM/
+
+# OS-generated files
+.DS_Store
+Thumbs.db
+
+# CMake generated files
+CMakeCache.txt
+CMakeFiles
+cmake_install.cmake
+Makefile.cmake
+compile_commands.json
+.cmake/

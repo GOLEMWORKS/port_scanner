@@ -1,1 +1,0 @@
-/usr/bin/c++ -O3 -DNDEBUG -Wl,-search_paths_first -Wl,-headerpad_max_install_names -L/usr/local/opt/tcl-tk/lib CMakeFiles/port_scanner_cli.dir/port_scanner_cli.cpp.o -o port_scanner_cli  -Wl,-rpath,/Users/vladimirk/projects/port_scanner/build/lib lib/libport_scanner.dylib
